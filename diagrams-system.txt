@@ -1,0 +1,89 @@
+## System Architecture
+
+```mermaid
+graph TB
+    Client[Svelte SPA]
+
+    Client -->|REST API| API[API Server<br/>Axum]
+    Client -->|Presigned URL PUT| Storage[(S3-Compatible<br/>Object Storage)]
+    Client -->|HLS Streaming| CDN[CDN<br/>Cloudflare]
+
+    API -->|Read/Write| DB[(PostgreSQL)]
+    API -->|Generate Presigned URL| Storage
+
+    Worker[Worker<br/>GStreamer] -->|Read/Write| DB
+    Worker -->|Read Input / Write HLS| Storage
+
+    API -->|Publish Tasks| Redis[(Redis<br/>Message Queue)]
+    Worker -->|Consume Tasks| Redis
+
+    CDN -->|Cache Miss| Storage
+
+    style Client fill:#4a9eff,color:#fff
+    style API fill:#2d8cf0,color:#fff
+    style Worker fill:#2d8cf0,color:#fff
+    style DB fill:#336791,color:#fff
+    style Redis fill:#dc382d,color:#fff
+    style Storage fill:#569a31,color:#fff
+    style CDN fill:#f48120,color:#fff
+```
+
+## Upload Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (Browser)
+    participant A as API Server
+    participant S as Object Storage
+    participant DB as PostgreSQL
+
+    U->>A: POST /api/videos/initiate (title, mimeType)
+    A->>DB: Create Video (PENDING_UPLOAD)
+    A->>S: Generate presigned URL
+    A-->>U: { id, uploadUrl }
+
+    U->>S: PUT uploadUrl (file bytes)
+    S-->>U: 200 OK
+
+    U->>A: POST /api/videos/{id}/complete
+    A->>S: HEAD object (check size)
+    A->>S: GET range 0-4095 (check file signature)
+    A->>DB: Set status = UPLOADED, create Task (PENDING)
+    A-->>U: { id, status: UPLOADED }
+
+    loop Poll for link
+        U->>A: GET /api/videos/{id}/status
+        A->>DB: Read video record
+        A-->>U: { status, shareUrl: null | url }
+    end
+```
+
+## Streaming Flow
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer (Browser)
+    participant A as API Server
+    participant CDN as CDN
+    participant S as Object Storage
+    participant DB as PostgreSQL
+
+    V->>A: GET /api/videos/share/{shareToken}
+    A->>DB: Find by share token
+    A-->>V: { title, streamUrl }
+
+    V->>CDN: GET master.m3u8
+    CDN->>S: Cache miss → fetch from origin
+    S-->>CDN: master.m3u8
+    CDN-->>V: master.m3u8
+
+    Note over V: Player selects quality tier
+
+    V->>CDN: GET low/playlist.m3u8
+    CDN-->>V: playlist.m3u8 (from cache or origin)
+
+    loop For each segment
+        V->>CDN: GET low/segment_001.ts
+        CDN-->>V: segment (from edge cache)
+    end
+```

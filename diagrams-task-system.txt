@@ -1,0 +1,80 @@
+## Task System Architecture
+
+```mermaid
+graph TB
+    subgraph API Server
+        UC[Use Case] -->|Same DB transaction| DB_Write[Write Video + Task<br/>status=PENDING]
+    end
+
+    subgraph Worker Process
+        Poller[Outbox Poller<br/>distributed lock]
+        Consumer[Task Consumer]
+        Recovery[Stale Recovery]
+        Handlers[Task Handlers]
+    end
+
+    DB[(PostgreSQL<br/>Source of Truth)]
+    Redis[(Redis<br/>Message Queue)]
+
+    DB_Write --> DB
+    Poller -->|1. Poll PENDING tasks in batch| DB
+    Poller -->|2. Mark IN_PROGRESS| DB
+    Poller -->|3. Publish batch| Redis
+    Consumer -->|4. Consume| Redis
+    Consumer -->|5. Dispatch| Handlers
+    Handlers -->|6. Update status| DB
+    Recovery -->|Reset stuck IN_PROGRESS → PENDING| DB
+
+    style DB fill:#336791,color:#fff
+    style Redis fill:#dc382d,color:#fff
+    style Poller fill:#f5a623,color:#fff
+    style Consumer fill:#2d8cf0,color:#fff
+    style Recovery fill:#999,color:#fff
+```
+
+## Task Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Use case creates task<br/>(same DB transaction)
+
+    PENDING --> IN_PROGRESS: Outbox poller picks up<br/>+ publishes to Redis
+
+    IN_PROGRESS --> COMPLETED: Handler succeeds
+    IN_PROGRESS --> DEAD_LETTER: Permanent failure
+    IN_PROGRESS --> PENDING: Stale recovery<br/>(stuck beyond timeout)
+
+    COMPLETED --> PENDING: Recurring task<br/>(rescheduled with new nextRunAt)
+
+    COMPLETED --> [*]
+    DEAD_LETTER --> [*]
+```
+
+## Processing Pipeline (Process Video Task)
+
+```mermaid
+graph LR
+    subgraph GStreamer Pipeline
+        Source[S3 Source<br/>Read via URL] --> Decode[Decode]
+        Decode --> Enc1[Encode 360p]
+        Decode --> Enc2[Encode 720p]
+        Decode --> Enc3[Encode 1080p]
+        Enc1 --> Mux1[HLS Mux]
+        Enc2 --> Mux2[HLS Mux]
+        Enc3 --> Mux3[HLS Mux]
+        Mux1 --> Sink1[S3 Sink<br/>low/]
+        Mux2 --> Sink2[S3 Sink<br/>medium/]
+        Mux3 --> Sink3[S3 Sink<br/>high/]
+    end
+
+    DB[(PostgreSQL)]
+
+    Sink1 -.->|First segment done<br/>→ generate shareToken<br/>→ status=PARTIAL| DB
+    Sink3 -.->|All segments done<br/>→ status=PROCESSED| DB
+
+    style Source fill:#569a31,color:#fff
+    style Sink1 fill:#569a31,color:#fff
+    style Sink2 fill:#569a31,color:#fff
+    style Sink3 fill:#569a31,color:#fff
+    style DB fill:#336791,color:#fff
+```
