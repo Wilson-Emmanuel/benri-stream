@@ -314,34 +314,75 @@ Workflow: **spec → implement → test**.
 
 ## Running
 
-*Prerequisites: Rust, PostgreSQL, Redis, GStreamer dev libraries, Node.js*
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (stable)
+- [Docker](https://docs.docker.com/get-docker/) (for dependencies below)
+- [Node.js](https://nodejs.org/) (for frontend)
+
+### 1. Start dependencies
 
 ```bash
-# Backend
-cp .env.example .env              # configure DB, S3, Redis
-cargo build                       # build all crates
-cargo run --bin api               # start API server
-cargo run --bin worker            # start worker (separate terminal)
-
-# Frontend
-cd frontend
-npm install
-npm run dev                       # dev server with API proxy
+docker compose up -d
 ```
 
-<!-- TODO: Docker Compose setup -->
+This starts all dependencies via Docker Compose:
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| Postgres | `postgres:17` | 5432 | Data store |
+| Redis | `redis:8` | 6379 | Message queue + distributed lock |
+| MinIO | `minio/minio` | 9000 (API), 9001 (console) | S3-compatible object storage |
+| Nginx | `nginx:alpine` | 8888 | CDN simulator — caches HLS segments from MinIO |
+
+MinIO bucket (`benri-stream`) is auto-created with public read access.
+Data persists across restarts via Docker volumes.
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Defaults work out of the box with the Docker Compose setup. Edit `.env` if you need
+different ports or credentials.
+
+### 3. Start the backend
+
+```bash
+# Terminal 1 — API server (runs DB migrations on startup)
+source .env && cargo run --bin api
+
+# Terminal 2 — Worker (task consumer, poller, recovery)
+source .env && cargo run --bin worker
+```
+
+### 4. Start the frontend
+
+```bash
+cd frontend
+npm install
+npm run dev    # dev server at http://localhost:5173, proxies /api to localhost:8080
+```
+
+### Stopping
+
+```bash
+docker compose down       # stop dependencies (data preserved in volumes)
+docker compose down -v    # stop and delete all data
+```
 
 ---
 
 ## Tech Stack
 
-| Concern | Choice |
-|---------|--------|
-| Language | Rust |
-| Web framework | Axum |
-| Database | PostgreSQL + sqlx |
-| Storage | S3-compatible (aws-sdk-s3) |
-| Transcoding | GStreamer (gstreamer-rs) |
-| Message queue | Redis (List as queue) |
-| Frontend | Svelte + hls.js |
-| CDN | Cloudflare (or similar) |
+| Concern | Choice | Dev setup |
+|---------|--------|-----------|
+| Language | Rust | |
+| Web framework | Axum | |
+| Database | PostgreSQL + sqlx | Postgres 17 via Docker |
+| Storage | S3-compatible (aws-sdk-s3) | MinIO via Docker |
+| Transcoding | GStreamer (gstreamer-rs) | |
+| Message queue | Redis (List as queue) | Redis 8 via Docker |
+| Frontend | Svelte + hls.js | |
+| CDN | Cloudflare (or similar) | Nginx via Docker |

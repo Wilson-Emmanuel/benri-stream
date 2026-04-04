@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16
+    image: postgres:17
     environment:
       POSTGRES_DB: benri_stream
       POSTGRES_USER: postgres
@@ -11,7 +11,7 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   redis:
-    image: redis:7
+    image: redis:8
     ports:
       - "6379:6379"
 
@@ -26,6 +26,15 @@ services:
       - "9001:9001"
     volumes:
       - miniodata:/data
+
+  cdn:
+    image: nginx:alpine
+    depends_on:
+      - minio
+    ports:
+      - "8888:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
   minio-setup:
     image: minio/mc
