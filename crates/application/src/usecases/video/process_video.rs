@@ -3,7 +3,7 @@ use std::sync::Arc;
 use domain::ports::storage::StoragePort;
 use domain::ports::transcoder::TranscoderPort;
 use domain::ports::video::VideoRepository;
-use domain::video::{generate_share_token, quality::QualityLevel, VideoId, VideoStatus};
+use domain::video::{generate_share_token, VideoId, VideoStatus};
 
 pub struct ProcessVideoUseCase {
     video_repo: Arc<dyn VideoRepository>,
@@ -68,7 +68,6 @@ impl ProcessVideoUseCase {
             .transcode_to_hls(
                 &video.upload_key,
                 &output_prefix,
-                QualityLevel::all(),
                 on_first_segment,
             )
             .await

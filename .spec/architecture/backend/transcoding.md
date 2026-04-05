@@ -44,14 +44,14 @@ pub trait TranscoderPort: Send + Sync {
         &self,
         input_key: &str,
         output_prefix: &str,
-        quality_levels: &[QualityLevel],
         on_first_segment: Box<dyn FnOnce() + Send>,
     ) -> Result<TranscodeResult, TranscoderError>;
 }
 ```
 
 The `on_first_segment` callback notifies the use case when the first segment is ready
-(triggers share token generation). The trait knows nothing about how transcoding happens.
+(triggers share token generation). The trait knows nothing about how transcoding happens —
+quality levels, codecs, and segment config are internal to the infrastructure implementation.
 
 **Implementation** (infrastructure):
 ```rust
@@ -74,8 +74,9 @@ filesystem involved.
 | Medium | 1280×720 | ~2500 kbps | 6 seconds |
 | High | 1920×1080 | ~5000 kbps | 6 seconds |
 
-Defined as an enum in the domain. The transcoder implementation reads these values —
-adjusting quality levels is a domain change, not an infrastructure one.
+Defined as an enum in infrastructure alongside the transcoder implementation. Quality
+levels are an implementation detail — the domain port just says "transcode to HLS"
+without knowing how many levels or what resolutions are produced.
 
 ---
 
@@ -91,7 +92,7 @@ instance capability (GPU vs CPU) and worker count is a deployment decision.
 
 | Config | Where | Description |
 |--------|-------|-------------|
-| Quality levels (resolution, bitrate) | `domain` | `src/video/quality.rs` — enum with resolution/bitrate methods |
+| Quality levels (resolution, bitrate) | `infrastructure` | `src/transcoder/quality.rs` — enum with resolution/bitrate methods |
 | Segment duration | `infrastructure` | `src/transcoder/gstreamer.rs` — pipeline config |
 | Codec settings (preset, profile) | `infrastructure` | `src/transcoder/gstreamer.rs` — pipeline config |
 
@@ -106,6 +107,6 @@ settings are implementation details in the infrastructure.
 |------|-------|------|
 | `TranscoderPort` trait | `domain` | `src/ports/transcoder.rs` |
 | `TranscoderError`, `ProbeResult`, `TranscodeResult` | `domain` | `src/ports/transcoder.rs` |
-| `QualityLevel` enum (resolution, bitrate) | `domain` | `src/video/quality.rs` |
+| `QualityLevel` enum (resolution, bitrate) | `infrastructure` | `src/transcoder/quality.rs` |
 | `GstreamerTranscoder` implementation | `infrastructure` | `src/transcoder/gstreamer.rs` |
 | Wiring (construct transcoder, pass to use cases) | `worker` | `src/main.rs` |

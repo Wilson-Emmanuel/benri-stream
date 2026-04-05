@@ -249,7 +249,7 @@ The shareable link is generated after the first segment succeeds.
 **Mutations** (progressive)
 1. Atomically set `status = PROCESSING` (only if still `UPLOADED`). If not, skip — another worker claimed it.
 2. Probe the file — confirm it's a valid, processable video
-3. Transcode first segment at all three quality levels, writing output directly to storage
+3. Transcode first segment at all configured quality levels, writing output directly to storage
 4. On first segment success → generate `shareToken`, set `status = PARTIAL`
 5. Continue transcoding remaining segments directly to storage
 6. On completion → set `status = PROCESSED`
@@ -310,7 +310,7 @@ Cleans up stuck or expired video records and orphaned files.
 |-------|-------|-------------|
 | Max upload file size | 1 GB | Presigned URL policy (storage-enforced) + client-side check + guard on complete |
 | Max title length | 100 chars | Guard on initiate |
-| Quality levels | 3 (low, medium, high) | Processing pipeline |
+| Adaptive streaming | Videos are transcoded into multiple quality levels; the player automatically selects the best quality for the viewer's connection | Processing pipeline |
 | Stale upload/processing timeout | 24 hours | Cleanup task |
 | Failed video retention | 30 days | Cleanup task |
 | Share token length | 21 chars | Generated on first segment success |

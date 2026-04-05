@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use domain::ports::storage::StoragePort;
 use domain::ports::transcoder::{ProbeResult, TranscodeResult, TranscoderError, TranscoderPort};
-use domain::video::quality::QualityLevel;
+
+use super::quality::QualityLevel;
 
 /// GStreamer-based transcoder. Reads from S3 via URL, writes HLS output directly to S3.
 /// No local disk involved — workers are stateless.
@@ -36,9 +37,9 @@ impl TranscoderPort for GstreamerTranscoder {
         &self,
         input_key: &str,
         output_prefix: &str,
-        quality_levels: &[QualityLevel],
         _on_first_segment: Box<dyn FnOnce() + Send>,
     ) -> Result<TranscodeResult, TranscoderError> {
+        let quality_levels = QualityLevel::all();
         // TODO: Build a GStreamer pipeline:
         //   Source (S3 URL) → Decode → [Encode low, Encode medium, Encode high] → HLS Mux → S3 Sink
         // Call on_first_segment() when the first segment is written for any quality level.

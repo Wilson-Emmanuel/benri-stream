@@ -1,7 +1,5 @@
 use async_trait::async_trait;
 
-use crate::video::quality::QualityLevel;
-
 #[async_trait]
 pub trait TranscoderPort: Send + Sync {
     async fn probe(&self, storage_key: &str) -> Result<ProbeResult, TranscoderError>;
@@ -10,7 +8,6 @@ pub trait TranscoderPort: Send + Sync {
         &self,
         input_key: &str,
         output_prefix: &str,
-        quality_levels: &[QualityLevel],
         on_first_segment: Box<dyn FnOnce() + Send>,
     ) -> Result<TranscodeResult, TranscoderError>;
 }
