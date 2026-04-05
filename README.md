@@ -33,6 +33,20 @@ A few things weren't specified. I made assumptions and designed around them.
 - **Horizontal scaling** — stateless workers, scale by adding instances
 - **Cost efficiency** — CDN reduces origin egress, no local disk on workers
 
+### How each requirement is fulfilled
+
+| Requirement | How | Details |
+|-------------|-----|---------|
+| Upload up to 1GB | Presigned URL with size policy + server-side validation via range read | [UC-VID-001, UC-VID-002](.spec/business-spec/video/video.md) |
+| Common formats | MP4, WebM, MOV, AVI, MKV — validated by file signature (magic bytes) | [Video spec](.spec/business-spec/video/video.md) |
+| Anonymous upload | No auth, no accounts — by design | |
+| Shareable link | Generated after first segment succeeds — link is guaranteed watchable | [UC-VID-005](.spec/business-spec/video/video.md), [Shareable link decision](#shareable-link-after-first-segment) |
+| Browser streaming | HLS via hls.js (all browsers), native on Safari/iOS | [Frontend SPA](.spec/architecture/frontend/spa.md) |
+| Time-to-stream > quality | Parallel encoding (low finishes first), 4-second segments, progressive status (PARTIAL) | [Parallel encoding decision](#parallel-encoding-over-sequential-passes), [Segment duration decision](#4-second-hls-segments) |
+| Horizontal scaling (bonus) | Stateless workers (no local disk), queue-based task dispatch, distributed lock for poller | [Task system](.spec/architecture/backend/task-system.md) |
+| Cost efficiency (bonus) | CDN edge-caches segments (origin hit once), presigned URLs bypass API server, original file discarded after processing | [CDN decision](#cdn-as-core-architecture), [Presigned URL decision](#presigned-url-upload) |
+| Consistent playback (bonus) | Adaptive bitrate HLS (3 quality levels), CDN edge serving | [Transcoding](.spec/architecture/backend/transcoding.md) |
+
 ---
 
 ## Architecture
@@ -95,17 +109,17 @@ prevent long-running tasks from starving shorter ones.
 
 <!-- Replace with rendered diagram image -->
 
-- Transcoded to HLS at three quality levels (360p, 720p, 1080p)
+- Transcoded to HLS at three quality levels (360p, 720p, 1080p), 4-second segments
 - All three levels produced simultaneously per segment — adaptive bitrate from the first streamable moment
-- Player (hls.js) fetches master manifest from CDN, auto-selects quality
-- Native HLS on iOS/Safari, hls.js for other browsers
+- Player (hls.js) fetches master manifest from CDN, auto-selects quality based on viewer's connection
+- Works in all browsers: Safari plays HLS natively, all others use hls.js
 
 ### GStreamer Pipeline
 
 <!-- Replace with rendered diagram image -->
 
-GStreamer reads input from S3 via URL, decodes, encodes at three quality levels in
-parallel, writes HLS segments directly back to S3. No local disk — workers are
+GStreamer reads input from S3 via URL, decodes once, encodes at three quality levels in
+parallel, writes 4-second HLS segments directly back to S3. No local disk — workers are
 stateless compute that scale horizontally.
 
 ---
@@ -172,16 +186,45 @@ Queue depth is the scaling signal — when it grows, add worker instances. Worke
 stateless, so scaling is trivial. The queue is behind a port trait; swapping to Kafka or
 Pub/Sub later is an infrastructure change.
 
-### Per-segment parallel transcoding
+### Parallel encoding over sequential passes
 
-For each segment, all three quality levels are produced simultaneously — not sequentially
-per tier.
+The input file is decoded once and fanned out to three encoders (360p, 720p, 1080p)
+running simultaneously. Each encoder writes to its own output path — no conflicts.
 
-Per-tier sequential means the entire video must finish at low quality before medium even
-starts. Per-segment means the first seconds are available in all qualities immediately.
-Viewers get adaptive bitrate from the first streamable moment.
+I considered three alternatives:
 
-Trade-off: uses more memory per job (three encoders concurrently), but better experience.
+| Approach | How it works | Time-to-first-segment | Total processing time | CPU at any moment |
+|----------|-------------|----------------------|----------------------|-------------------|
+| **Parallel** (chosen) | Decode once → 3 encoders simultaneously | ~4s (low finishes first naturally) | Shortest — one pass | High — 3 encoders |
+| **Sequential per level** | Low pass → medium pass → high pass | ~4s (all CPU on low) | ~3x longer — 3 full passes, 3 decodes | Low — 1 encoder |
+| **Low first, then medium+high parallel** | Low pass → medium+high simultaneously | ~4s (all CPU on low) | ~1.5x longer — 2 passes, 2 decodes | Varies |
+
+All three approaches produce the first low-quality segment in roughly the same time
+(low quality encoding is fast regardless). But parallel wins on total processing time
+because it decodes the input **once** instead of two or three times. Sequential passes
+re-read from storage and re-decode the entire file per pass — wasted I/O and CPU.
+
+The tradeoff is higher peak CPU/memory (three encoders concurrently), but workers scale
+horizontally — add more instances rather than more CPU per instance. Total work done is
+actually less with parallel (one decode vs three).
+
+### 4-second HLS segments
+
+Segment duration directly affects time-to-stream: the viewer waits for at least one
+full segment to be encoded before anything is watchable. Shorter segments = faster
+first playback.
+
+| Duration | Time-to-stream | File overhead | CDN efficiency |
+|----------|---------------|---------------|----------------|
+| 2s | ~2s | High — many small files, more HTTP requests per minute of video | More cache misses |
+| **4s** (chosen) | **~4s** | **Moderate** | **Good** |
+| 6s | ~6s | Low | Best — fewer, larger files |
+| 10s | ~10s | Lowest | Best |
+
+4 seconds balances fast time-to-stream with manageable file count. 2-second segments
+roughly double the number of files and manifest entries, increasing storage listing
+costs and player overhead for marginal time-to-stream gain. 6+ seconds delays first
+playback noticeably.
 
 ### GPU-accelerated transcoding
 

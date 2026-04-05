@@ -70,9 +70,9 @@ filesystem involved.
 
 | Level | Resolution | Target Bitrate | Segment Duration |
 |-------|-----------|---------------|-----------------|
-| Low | 640×360 | ~800 kbps | 6 seconds |
-| Medium | 1280×720 | ~2500 kbps | 6 seconds |
-| High | 1920×1080 | ~5000 kbps | 6 seconds |
+| Low | 640×360 | ~800 kbps | 4 seconds |
+| Medium | 1280×720 | ~2500 kbps | 4 seconds |
+| High | 1920×1080 | ~5000 kbps | 4 seconds |
 
 Defined as an enum in infrastructure alongside the transcoder implementation. Quality
 levels are an implementation detail — the domain port just says "transcode to HLS"

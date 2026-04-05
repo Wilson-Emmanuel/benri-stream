@@ -6,6 +6,10 @@ use domain::ports::transcoder::{ProbeResult, TranscodeResult, TranscoderError, T
 
 use super::quality::QualityLevel;
 
+/// Target HLS segment duration in seconds. Shorter = faster time-to-stream,
+/// longer = fewer files and better CDN cache efficiency. 4s is the balance.
+const SEGMENT_DURATION_SECS: u32 = 4;
+
 /// GStreamer-based transcoder. Reads from S3 via URL, writes HLS output directly to S3.
 /// No local disk involved — workers are stateless.
 ///
