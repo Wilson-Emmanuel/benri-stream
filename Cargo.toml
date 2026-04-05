@@ -15,7 +15,7 @@ edition = "2024"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-axum = { version = "0.8", features = ["multipart"] }
+axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
