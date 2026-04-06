@@ -4,6 +4,7 @@ use domain::ports::storage::{StorageError, StoragePort};
 use domain::ports::unit_of_work::UnitOfWork;
 use domain::ports::video::{RepositoryError, VideoRepository};
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
+use domain::task::metadata::process_video::ProcessVideoTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
 use domain::video::{VideoId, VideoStatus, MAX_UPLOAD_SIZE_BYTES};
 
@@ -83,6 +84,11 @@ impl CompleteUploadUseCase {
             return Err(Error::InvalidFileSignature);
         }
 
+        // Success path: atomic status update + ProcessVideo scheduling in one tx.
+        // Per rule #8, the task must be scheduled in the same transaction as the
+        // triggering business mutation. If the status update races another worker
+        // (status no longer PENDING_UPLOAD), we roll back the whole tx — no stale
+        // schedule.
         let mut tx = self
             .uow
             .begin()
@@ -93,13 +99,24 @@ impl CompleteUploadUseCase {
             .update_status_if(&video.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
+
+        if !updated {
+            // Don't commit — nothing changed. The dropped tx rolls back cleanly.
+            return Err(Error::AlreadyCompleted);
+        }
+
+        TaskScheduler::schedule(
+            tx.tasks(),
+            &ProcessVideoTaskMetadata { video_id: video.id.clone() },
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?;
+
         tx.commit()
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
-
-        if !updated {
-            return Err(Error::AlreadyCompleted);
-        }
 
         Ok(Output {
             id: video.id,
@@ -120,6 +137,7 @@ async fn schedule_delete(
     TaskScheduler::schedule(
         tx.tasks(),
         &DeleteVideoTaskMetadata { video_id: video_id.clone() },
+        None,
         None,
     )
     .await?;

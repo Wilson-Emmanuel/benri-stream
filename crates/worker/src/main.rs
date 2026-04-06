@@ -8,12 +8,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
+use tokio::signal;
+use tokio::sync::watch;
 
 use application::usecases::video::{
     cleanup_stale_videos::CleanupStaleVideosUseCase,
     delete_video::DeleteVideoUseCase,
     process_video::ProcessVideoUseCase,
 };
+use domain::task::metadata::cleanup_stale_videos::CleanupStaleVideosTaskMetadata;
+use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
+use domain::task::metadata::process_video::ProcessVideoTaskMetadata;
 use infrastructure::config::AppConfig;
 use infrastructure::postgres::unit_of_work::PgUnitOfWork;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
@@ -24,10 +29,10 @@ use infrastructure::redis::task_publisher::RedisTaskPublisher;
 use infrastructure::redis::task_consumer::RedisTaskConsumer;
 use infrastructure::redis::distributed_lock::DistributedLock;
 
-use handlers::{HandlerDispatch, TaskHandler, TaskHandlerInvoker};
-use handlers::process_video::ProcessVideoHandler;
+use handlers::{ErasedHandler, HandlerAdapter, HandlerDispatch, TaskHandlerInvoker};
 use handlers::cleanup_stale::CleanupStaleHandler;
 use handlers::delete_video::DeleteVideoHandler;
+use handlers::process_video::ProcessVideoHandler;
 
 #[tokio::main]
 async fn main() {
@@ -79,29 +84,35 @@ async fn main() {
         Arc::new(GstreamerTranscoder::new(storage.clone()));
 
     // Use cases
-    let process_video = Arc::new(ProcessVideoUseCase::new(
+    let process_video_uc = Arc::new(ProcessVideoUseCase::new(
         video_repo.clone(), uow.clone(), storage.clone(), transcoder,
     ));
-    let cleanup = Arc::new(CleanupStaleVideosUseCase::new(
+    let cleanup_uc = Arc::new(CleanupStaleVideosUseCase::new(
         video_repo.clone(), uow.clone(),
     ));
-    let delete_video = Arc::new(DeleteVideoUseCase::new(
+    let delete_video_uc = Arc::new(DeleteVideoUseCase::new(
         video_repo.clone(), uow.clone(), storage.clone(),
     ));
 
-    // Handler dispatch map
-    let mut handler_map: HashMap<String, Arc<dyn TaskHandler>> = HashMap::new();
+    // Handler dispatch map — one entry per task type. The adapter
+    // deserializes the task's metadata Value into the concrete type before
+    // invoking the typed handler.
+    let process_handler = Arc::new(ProcessVideoHandler::new(process_video_uc));
+    let cleanup_handler = Arc::new(CleanupStaleHandler::new(cleanup_uc));
+    let delete_handler = Arc::new(DeleteVideoHandler::new(delete_video_uc));
+
+    let mut handler_map: HashMap<String, Arc<dyn ErasedHandler>> = HashMap::new();
     handler_map.insert(
-        "ProcessVideoTaskMetadata".to_string(),
-        Arc::new(ProcessVideoHandler::new(process_video)),
+        ProcessVideoTaskMetadata::METADATA_TYPE.to_string(),
+        HandlerAdapter::wrap(process_handler),
     );
     handler_map.insert(
-        "CleanupStaleVideosTaskMetadata".to_string(),
-        Arc::new(CleanupStaleHandler::new(cleanup)),
+        CleanupStaleVideosTaskMetadata::METADATA_TYPE.to_string(),
+        HandlerAdapter::wrap(cleanup_handler),
     );
     handler_map.insert(
-        "DeleteVideoTaskMetadata".to_string(),
-        Arc::new(DeleteVideoHandler::new(delete_video)),
+        DeleteVideoTaskMetadata::METADATA_TYPE.to_string(),
+        HandlerAdapter::wrap(delete_handler),
     );
     let handler: Arc<dyn TaskHandlerInvoker> = Arc::new(HandlerDispatch::new(handler_map));
 
@@ -122,15 +133,54 @@ async fn main() {
         task_repo.clone(), DistributedLock::new(redis_client.clone()),
     );
     let system_checker = system_checker::SystemTaskChecker::new(
-        task_repo, DistributedLock::new(redis_client),
+        task_repo, uow, DistributedLock::new(redis_client),
     );
+
+    // Shutdown signal — all long-running components observe this and drain
+    // gracefully when the process is asked to stop.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tracing::info!("Worker started");
 
+    let consumer_shutdown = shutdown_rx.clone();
+    let poller_shutdown = shutdown_rx.clone();
+    let recovery_shutdown = shutdown_rx.clone();
+    let checker_shutdown = shutdown_rx;
+
+    let consumer_handle = tokio::spawn(async move {
+        task_consumer.run(consumer_shutdown).await;
+    });
+    let poller_handle = tokio::spawn(async move {
+        outbox_poller.run(poller_shutdown).await;
+    });
+    let recovery_handle = tokio::spawn(async move {
+        stale_recovery.run(recovery_shutdown).await;
+    });
+    let checker_handle = tokio::spawn(async move {
+        system_checker.run(checker_shutdown).await;
+    });
+
+    // Wait for SIGINT / SIGTERM, then broadcast shutdown and wait for all
+    // components to drain.
+    wait_for_shutdown().await;
+    tracing::info!("shutdown signal received, draining workers");
+    let _ = shutdown_tx.send(true);
+
+    let _ = tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
+    tracing::info!("Worker stopped");
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
     tokio::select! {
-        _ = task_consumer.run() => {},
-        _ = outbox_poller.run() => {},
-        _ = stale_recovery.run() => {},
-        _ = system_checker.run() => {},
+        _ = signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
     }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    let _ = signal::ctrl_c().await;
 }

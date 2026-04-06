@@ -111,6 +111,7 @@ async fn schedule_delete(
         tx.tasks(),
         &DeleteVideoTaskMetadata { video_id: video_id.clone() },
         None,
+        None,
     )
     .await?;
     tx.commit().await?;
@@ -129,6 +130,7 @@ async fn fail_and_schedule_delete(
     TaskScheduler::schedule(
         tx.tasks(),
         &DeleteVideoTaskMetadata { video_id: video_id.clone() },
+        None,
         None,
     )
     .await?;

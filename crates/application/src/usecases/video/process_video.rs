@@ -187,6 +187,7 @@ async fn fail_and_schedule_delete(
         tx.tasks(),
         &DeleteVideoTaskMetadata { video_id: video_id.clone() },
         None,
+        None,
     )
     .await?;
     tx.commit().await?;

@@ -10,6 +10,17 @@ CREATE TABLE tasks (
     error TEXT,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+
+    -- Scheduling config denormalized from TaskMetadata at schedule time so the
+    -- consumer can honor max_retries, retry_base_delay, execution_interval,
+    -- and processing_timeout without needing to reconstruct the concrete
+    -- TaskMetadata type from the JSON payload. See
+    -- architecture/backend/task-system.md for the rationale.
+    max_retries INTEGER,
+    retry_base_delay_ms BIGINT NOT NULL,
+    execution_interval_ms BIGINT,
+    processing_timeout_ms BIGINT NOT NULL,
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

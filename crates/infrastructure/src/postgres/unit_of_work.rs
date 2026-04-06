@@ -139,9 +139,18 @@ impl TaskMutations for PgTxScope {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO tasks (id, metadata_type, metadata, status, ordering_key, trace_id,
-             attempt_count, next_run_at, error, started_at, completed_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            "INSERT INTO tasks (
+                id, metadata_type, metadata, status, ordering_key, trace_id,
+                attempt_count, next_run_at, error, started_at, completed_at,
+                max_retries, retry_base_delay_ms, execution_interval_ms, processing_timeout_ms,
+                created_at, updated_at
+             )
+             VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15,
+                $16, $17
+             )",
         )
         .bind(task.id.0)
         .bind(&task.metadata_type)
@@ -154,6 +163,10 @@ impl TaskMutations for PgTxScope {
         .bind(&task.error)
         .bind(task.started_at)
         .bind(task.completed_at)
+        .bind(task.max_retries)
+        .bind(task.retry_base_delay_ms)
+        .bind(task.execution_interval_ms)
+        .bind(task.processing_timeout_ms)
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut **tx)
