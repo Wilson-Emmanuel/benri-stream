@@ -32,6 +32,8 @@ impl DeleteVideoUseCase {
     }
 
     pub async fn execute(&self, input: Input) -> Result<(), Error> {
+        tracing::info!(video_id = %input.video_id, "deleting video");
+
         let video = self
             .video_repo
             .find_by_id(&input.video_id)

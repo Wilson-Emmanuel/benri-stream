@@ -72,6 +72,7 @@ impl TxScope for PgTxScope {
 #[async_trait]
 impl VideoMutations for PgTxScope {
     async fn insert(&mut self, video: &Video) -> Result<(), RepositoryError> {
+        tracing::info!(video_id = %video.id, status = ?video.status, "db: inserting video");
         let tx = self.tx_mut()?;
         sqlx::query(
             "INSERT INTO videos (id, share_token, title, format, status, upload_key, created_at)
@@ -96,6 +97,12 @@ impl VideoMutations for PgTxScope {
         expected: VideoStatus,
         new_status: VideoStatus,
     ) -> Result<bool, RepositoryError> {
+        tracing::info!(
+            video_id = %id,
+            expected = ?expected,
+            new_status = ?new_status,
+            "db: conditional video status update",
+        );
         let tx = self.tx_mut()?;
         let result = sqlx::query(
             "UPDATE videos SET status = $3 WHERE id = $1 AND status = $2",
@@ -110,6 +117,7 @@ impl VideoMutations for PgTxScope {
     }
 
     async fn set_share_token(&mut self, id: &VideoId, token: &str) -> Result<(), RepositoryError> {
+        tracing::info!(video_id = %id, "db: setting video share token");
         let tx = self.tx_mut()?;
         sqlx::query("UPDATE videos SET share_token = $2 WHERE id = $1")
             .bind(id.0)
@@ -121,6 +129,7 @@ impl VideoMutations for PgTxScope {
     }
 
     async fn delete(&mut self, id: &VideoId) -> Result<(), RepositoryError> {
+        tracing::info!(video_id = %id, "db: deleting video");
         let tx = self.tx_mut()?;
         sqlx::query("DELETE FROM videos WHERE id = $1")
             .bind(id.0)
@@ -134,6 +143,12 @@ impl VideoMutations for PgTxScope {
 #[async_trait]
 impl TaskMutations for PgTxScope {
     async fn create(&mut self, task: &Task) -> Result<Task, RepositoryError> {
+        tracing::info!(
+            task_id = %task.id,
+            metadata_type = %task.metadata_type,
+            ordering_key = ?task.ordering_key,
+            "db: creating task",
+        );
         let tx = self.tx_mut()?;
         let metadata_str = serde_json::to_string(&task.metadata)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -181,6 +196,11 @@ impl TaskMutations for PgTxScope {
         metadata_type: &str,
         ordering_key: &str,
     ) -> Result<Option<Task>, RepositoryError> {
+        tracing::debug!(
+            metadata_type,
+            ordering_key,
+            "db: dedup lookup by ordering key",
+        );
         let tx = self.tx_mut()?;
         let row = sqlx::query(
             "SELECT * FROM tasks

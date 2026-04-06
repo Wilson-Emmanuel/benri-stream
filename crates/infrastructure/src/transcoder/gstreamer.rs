@@ -186,6 +186,8 @@ impl TranscoderPort for GstreamerTranscoder {
         use gstreamer as gst;
         use gstreamer_pbutils as gst_pbutils;
 
+        tracing::info!(storage_key, "transcoder: probing video file");
+
         let url = self.input_url(storage_key).await?;
 
         // Discoverer runs synchronously — use spawn_blocking to avoid blocking tokio
@@ -236,6 +238,8 @@ impl TranscoderPort for GstreamerTranscoder {
         on_first_segment: Box<dyn FnOnce() + Send>,
     ) -> Result<TranscodeResult, TranscoderError> {
         use gstreamer as gst;
+
+        tracing::info!(input_key, output_prefix, "transcoder: starting HLS transcode");
 
         gst::init().map_err(|e| TranscoderError::TranscodeFailed(format!("gst init: {e}")))?;
 

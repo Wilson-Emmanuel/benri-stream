@@ -23,6 +23,8 @@ impl TaskPublisher for RedisTaskPublisher {
             return Ok(true);
         }
 
+        tracing::info!(count = task_ids.len(), "redis: publishing tasks to queue");
+
         let mut conn = self
             .client
             .get_multiplexed_async_connection()

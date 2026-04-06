@@ -28,6 +28,8 @@ impl CompleteUploadUseCase {
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
+        tracing::info!(video_id = %input.id, "completing upload");
+
         let video = self
             .video_repo
             .find_by_id(&input.id)

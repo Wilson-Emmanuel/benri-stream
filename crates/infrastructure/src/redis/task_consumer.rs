@@ -35,6 +35,7 @@ impl TaskConsumer for RedisTaskConsumer {
             Some(id_str) => {
                 let uuid = Uuid::parse_str(&id_str)
                     .map_err(|e| QueueError::Internal(e.to_string()))?;
+                tracing::debug!(task_id = %uuid, "redis: popped task from queue");
                 metrics::counter!("task.received").increment(1);
                 Ok(Some(TaskId(uuid)))
             }

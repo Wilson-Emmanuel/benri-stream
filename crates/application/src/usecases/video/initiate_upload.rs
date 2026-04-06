@@ -18,6 +18,12 @@ impl InitiateUploadUseCase {
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
+        tracing::info!(
+            mime_type = %input.mime_type,
+            title_len = input.title.len(),
+            "initiating upload",
+        );
+
         let title = input.title.trim().to_string();
         if title.is_empty() {
             return Err(Error::TitleRequired);

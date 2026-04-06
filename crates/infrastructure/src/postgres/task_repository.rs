@@ -149,6 +149,7 @@ impl TaskRepository for PostgresTaskRepository {
         ids: &[TaskId],
         started_at: DateTime<Utc>,
     ) -> Result<(), RepositoryError> {
+        tracing::info!(count = ids.len(), "db: marking tasks in progress");
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| id.0).collect();
         sqlx::query(
             "UPDATE tasks SET status = 'IN_PROGRESS', started_at = $2, updated_at = $2
@@ -191,7 +192,11 @@ impl TaskRepository for PostgresTaskRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        Ok(result.rows_affected() as i32)
+        let count = result.rows_affected() as i32;
+        if count > 0 {
+            tracing::info!(count, "db: reset stale tasks to PENDING");
+        }
+        Ok(count)
     }
 
     async fn count_active_by_type(&self, metadata_type: &str) -> Result<i64, RepositoryError> {

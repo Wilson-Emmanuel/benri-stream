@@ -27,6 +27,8 @@ impl StoragePort for S3StorageClient {
         _max_size_bytes: i64,
         expiry_secs: u64,
     ) -> Result<PresignedUpload, StorageError> {
+        tracing::info!(key, content_type, expiry_secs, "s3: generating presigned upload url");
+
         let config = PresigningConfig::expires_in(Duration::from_secs(expiry_secs))
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -47,6 +49,7 @@ impl StoragePort for S3StorageClient {
     }
 
     async fn head_object(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
+        tracing::info!(key, "s3: head object");
         match self.client.head_object().bucket(&self.bucket).key(key).send().await {
             Ok(output) => Ok(Some(ObjectMetadata {
                 size_bytes: output.content_length().unwrap_or(0),
@@ -64,6 +67,7 @@ impl StoragePort for S3StorageClient {
     }
 
     async fn read_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
+        tracing::info!(key, start, end, "s3: reading object range");
         let output = self
             .client
             .get_object()
@@ -88,6 +92,7 @@ impl StoragePort for S3StorageClient {
         key: &str,
         content_type: &str,
     ) -> Result<(), StorageError> {
+        tracing::info!(key, content_type, "s3: uploading object from path");
         let body = aws_sdk_s3::primitives::ByteStream::from_path(local_path)
             .await
             .map_err(|e| StorageError::Internal(format!("failed to read {}: {}", local_path.display(), e)))?;
@@ -106,6 +111,7 @@ impl StoragePort for S3StorageClient {
     }
 
     async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
+        tracing::info!(key, "s3: deleting object");
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -117,6 +123,7 @@ impl StoragePort for S3StorageClient {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
+        tracing::info!(prefix, "s3: deleting prefix");
         let mut token: Option<String> = None;
         loop {
             let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(prefix);

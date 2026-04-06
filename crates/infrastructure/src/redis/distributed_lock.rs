@@ -27,6 +27,7 @@ impl DistributedLock {
         key: &str,
         ttl_secs: u64,
     ) -> Result<Option<LockToken>, String> {
+        tracing::debug!(key, ttl_secs, "lock: acquire attempt");
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
@@ -52,6 +53,7 @@ impl DistributedLock {
     /// match the current holder — this is the correct behavior for TTL
     /// expiration followed by another acquirer.
     pub async fn release(&self, key: &str, token: &LockToken) -> Result<(), String> {
+        tracing::debug!(key, "lock: release");
         let mut conn = self
             .client
             .get_multiplexed_async_connection()

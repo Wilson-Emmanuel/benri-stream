@@ -46,12 +46,14 @@ async fn main() {
 
     let config = AppConfig::from_env();
 
+    tracing::info!("worker: connecting to database");
     // Database
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
+    tracing::info!("worker: database connected");
 
     // S3
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -68,6 +70,7 @@ async fn main() {
     );
 
     // Redis
+    tracing::info!("worker: connecting to redis");
     let redis_client =
         redis::Client::open(config.redis_url.as_str()).expect("Invalid Redis URL");
 

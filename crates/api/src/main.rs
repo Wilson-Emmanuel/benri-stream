@@ -37,16 +37,19 @@ async fn main() {
 
     let config = AppConfig::from_env();
 
+    tracing::info!("api: connecting to database");
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
 
+    tracing::info!("api: running migrations");
     sqlx::migrate!("../../migrations")
         .run(&pool)
         .await
         .expect("Failed to run migrations");
+    tracing::info!("api: migrations applied");
 
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(config.s3_region.clone()));

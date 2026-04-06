@@ -33,6 +33,8 @@ impl CleanupStaleVideosUseCase {
     }
 
     pub async fn execute(&self) -> Result<CleanupStats, Error> {
+        tracing::info!("running stale video cleanup sweep");
+
         let now = Utc::now();
         let stale_threshold = now - chrono::Duration::hours(24);
         let failed_threshold = now - chrono::Duration::hours(24);
@@ -97,6 +99,13 @@ impl CleanupStaleVideosUseCase {
             }
             stats.failed_scheduled += 1;
         }
+
+        tracing::info!(
+            pending_scheduled = stats.pending_scheduled,
+            stuck_scheduled = stats.stuck_scheduled,
+            failed_scheduled = stats.failed_scheduled,
+            "stale video cleanup sweep complete",
+        );
 
         Ok(stats)
     }
