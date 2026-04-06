@@ -14,6 +14,7 @@ See use cases below for details on each step.
 | Date | Change | Author |
 |------|--------|--------|
 | 2026-04-03 | Initial spec | Wilson |
+| 2026-04-06 | Split deletion into UC-VID-007 (`DeleteVideo` task). UC-VID-002 and UC-VID-005 schedule it directly on rejection/failure paths. UC-VID-006 becomes a safety-net sweep that schedules instead of mutating. FAILED retention reduced from 30 days to 24 hours. | Wilson |
 
 ---
 
@@ -146,7 +147,12 @@ signature (magic bytes), and checks actual size from storage metadata.
 | `INVALID_FILE_SIGNATURE` | First bytes don't match declared format |
 | `ALPROCESSED_COMPLETED` | Video is past PENDING_UPLOAD |
 
-**Side Effects**: N/A (worker picks up `UPLOADED` videos independently)
+**Side Effects**
+
+- On `FILE_TOO_LARGE` or `INVALID_FILE_SIGNATURE`: schedule a `DeleteVideo` task
+  ([UC-VID-007](#uc-vid-007)) to immediately remove the rejected upload and its
+  video record. The task is scheduled in the same DB transaction as the rejection.
+  No side effect on the success path — the worker picks up `UPLOADED` videos independently.
 
 **Idempotency**: Not idempotent — calling again after completion returns `ALPROCESSED_COMPLETED`.
 
@@ -253,23 +259,30 @@ The shareable link is generated after the first segment succeeds.
 4. On first segment success → generate `shareToken`, set `status = PARTIAL`
 5. Continue transcoding remaining segments directly to storage
 6. On completion → set `status = PROCESSED`
-7. Delete original file from storage
+7. Delete original upload from storage (HLS output is kept). Best-effort —
+   a failure here leaves an orphan that the cleanup safety-net (UC-VID-006) collects.
 
 On probe failure:
-- Set `status = FAILED`
-- Delete original file from storage
-- No share token generated — uploader sees FAILED when polling
+- Atomically set `status = FAILED` and schedule a `DeleteVideo` task
+  ([UC-VID-007](#uc-vid-007)) in the same DB transaction. The task removes the
+  original upload and the video record after the FAILED retention window.
+- No share token generated — uploader sees FAILED when polling.
 
 On segment failure:
 - If some segments already succeeded: set `status = INCOMPLETE`,
-  keep successful segments. Video is streamable up to that point.
-- If no segments succeeded: set `status = FAILED`. No share token generated.
+  delete the original upload (HLS output is kept). Video is streamable up to
+  that point. INCOMPLETE videos are NOT scheduled for deletion.
+- If no segments succeeded: atomically set `status = FAILED` and schedule a
+  `DeleteVideo` task in the same DB transaction. No share token generated.
 
 **Output**: N/A (system process)
 
 **Error Codes**: N/A (failures recorded on the video entity)
 
-**Side Effects**: N/A
+**Side Effects**
+
+- On probe failure or zero-segments failure: schedules `DeleteVideo`
+  ([UC-VID-007](#uc-vid-007)) in the same transaction as the `FAILED` status update.
 
 **Idempotency**: Idempotent — re-running on PROCESSED is a no-op.
 
@@ -281,26 +294,85 @@ On segment failure:
 
 **Triggered by**: Worker runs daily on schedule
 
-Cleans up stuck or expired video records and orphaned files.
+Acts as a **safety-net sweep** for videos that should be removed but were not
+scheduled for deletion through the primary path (e.g. worker crashed before
+[UC-VID-002](#uc-vid-002) or [UC-VID-005](#uc-vid-005) could schedule a `DeleteVideo`
+task, or the task system was unavailable). This use case **does not delete files
+or rows directly** — all deletion goes through `DeleteVideo` ([UC-VID-007](#uc-vid-007))
+so retries, ordering, and dedup are uniform across the system.
 
 **Input**: N/A
 
 **Guards**: N/A
 
 **Mutations**
-- `PENDING_UPLOAD` older than 24 hours → delete record + any storage files
-- `UPLOADED` or `PROCESSING` older than 24 hours with no progress → set `status = FAILED`,
-  delete original file
-- `FAILED` videos older than 30 days → delete record + any remaining files
+- `PENDING_UPLOAD` older than 24 hours → schedule `DeleteVideo`
+- `UPLOADED` or `PROCESSING` older than 24 hours with no progress →
+  atomically set `status = FAILED` and schedule `DeleteVideo` (same transaction)
+- `FAILED` videos older than 24 hours → schedule `DeleteVideo`
 - `INCOMPLETE` videos are NOT cleaned up — they have working segments and are streamable
+
+Scheduling is dedup-by-default: re-running the sweep will not create duplicate
+`DeleteVideo` tasks for the same video while a previous task is still active
+(see [task-system.md](../../architecture/backend/task-system.md) on
+ordering-key dedup).
 
 **Output**: N/A
 
 **Error Codes**: N/A
 
+**Side Effects**: Schedules `DeleteVideo` tasks for qualifying videos.
+
+**Idempotency**: Idempotent — re-running schedules nothing new for videos
+that already have an active `DeleteVideo` task.
+
+---
+
+### Delete Video (System) {#UC-VID-007}
+
+**Actor**: System — not user-facing
+
+**Triggered by**: `DeleteVideo` task. Scheduled by:
+- [UC-VID-002](#uc-vid-002) on rejection (`FILE_TOO_LARGE`, `INVALID_FILE_SIGNATURE`)
+- [UC-VID-005](#uc-vid-005) on probe failure or zero-segments failure
+- [UC-VID-006](#uc-vid-006) safety-net sweep
+
+Removes a video's storage objects and database record. This is the **single
+delete path** for videos in the system — the only place where storage and DB
+removal are co-located. Designed to be retried by the task system on transient
+infrastructure failures.
+
+**Input**
+
+| Field | Required | Description and validation |
+|-------|----------|---------------------------|
+| `videoId` | Yes | The video to delete |
+
+**Guards**
+1. Video record exists. If not (already deleted), the task completes as `Skip` —
+   running on a missing video is a no-op.
+
+**Mutations** (in order — each step must succeed before the next runs)
+1. `storage.delete_prefix("videos/{id}/")` — removes the entire HLS output tree
+   (master.m3u8, per-quality playlists, .ts segments). No-op if the prefix is
+   empty (e.g. probe-failed videos that never produced segments).
+2. `storage.delete_object(upload_key)` — removes the original uploaded file.
+   No-op if the object is already gone (e.g. successful processing already
+   deleted it inline).
+3. `video_repo.delete(id)` — removes the database row.
+
+If any step fails, the task returns a retryable failure. The next attempt
+re-checks the guard and re-runs the remaining steps. Both storage operations
+are tolerant of "already deleted," so retries are safe.
+
+**Output**: N/A
+
+**Error Codes**: N/A (system process — failures handled by task retry / dead letter)
+
 **Side Effects**: N/A
 
-**Idempotency**: Idempotent — re-running deletes only newly qualifying records.
+**Idempotency**: Idempotent — re-running on a missing video, missing prefix,
+or missing object is a no-op at every step.
 
 ---
 
@@ -312,5 +384,5 @@ Cleans up stuck or expired video records and orphaned files.
 | Max title length | 100 chars | Guard on initiate |
 | Adaptive streaming | Videos are transcoded into multiple quality levels; the player automatically selects the best quality for the viewer's connection | Processing pipeline |
 | Stale upload/processing timeout | 24 hours | Cleanup task |
-| Failed video retention | 30 days | Cleanup task |
+| Failed video retention | 24 hours | Cleanup task |
 | Share token length | 21 chars | Generated on first segment success |

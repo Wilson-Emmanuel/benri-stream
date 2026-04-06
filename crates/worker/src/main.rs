@@ -11,9 +11,11 @@ use sqlx::postgres::PgPoolOptions;
 
 use application::usecases::video::{
     cleanup_stale_videos::CleanupStaleVideosUseCase,
+    delete_video::DeleteVideoUseCase,
     process_video::ProcessVideoUseCase,
 };
 use infrastructure::config::AppConfig;
+use infrastructure::postgres::unit_of_work::PgUnitOfWork;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
 use infrastructure::postgres::task_repository::PostgresTaskRepository;
 use infrastructure::storage::s3_client::S3StorageClient;
@@ -25,6 +27,7 @@ use infrastructure::redis::distributed_lock::DistributedLock;
 use handlers::{HandlerDispatch, TaskHandler, TaskHandlerInvoker};
 use handlers::process_video::ProcessVideoHandler;
 use handlers::cleanup_stale::CleanupStaleHandler;
+use handlers::delete_video::DeleteVideoHandler;
 
 #[tokio::main]
 async fn main() {
@@ -63,11 +66,13 @@ async fn main() {
     let redis_client =
         redis::Client::open(config.redis_url.as_str()).expect("Invalid Redis URL");
 
-    // Repositories
+    // Repositories + UnitOfWork
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =
         Arc::new(PostgresVideoRepository::new(pool.clone()));
     let task_repo: Arc<dyn domain::ports::task::TaskRepository> =
-        Arc::new(PostgresTaskRepository::new(pool));
+        Arc::new(PostgresTaskRepository::new(pool.clone()));
+    let uow: Arc<dyn domain::ports::unit_of_work::UnitOfWork> =
+        Arc::new(PgUnitOfWork::new(pool));
 
     // Transcoder
     let transcoder: Arc<dyn domain::ports::transcoder::TranscoderPort> =
@@ -75,10 +80,13 @@ async fn main() {
 
     // Use cases
     let process_video = Arc::new(ProcessVideoUseCase::new(
-        video_repo.clone(), storage.clone(), transcoder,
+        video_repo.clone(), uow.clone(), storage.clone(), transcoder,
     ));
     let cleanup = Arc::new(CleanupStaleVideosUseCase::new(
-        video_repo.clone(), storage.clone(),
+        video_repo.clone(), uow.clone(),
+    ));
+    let delete_video = Arc::new(DeleteVideoUseCase::new(
+        video_repo.clone(), uow.clone(), storage.clone(),
     ));
 
     // Handler dispatch map
@@ -90,6 +98,10 @@ async fn main() {
     handler_map.insert(
         "CleanupStaleVideosTaskMetadata".to_string(),
         Arc::new(CleanupStaleHandler::new(cleanup)),
+    );
+    handler_map.insert(
+        "DeleteVideoTaskMetadata".to_string(),
+        Arc::new(DeleteVideoHandler::new(delete_video)),
     );
     let handler: Arc<dyn TaskHandlerInvoker> = Arc::new(HandlerDispatch::new(handler_map));
 

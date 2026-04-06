@@ -172,6 +172,20 @@ impl TaskScheduler {
 }
 ```
 
+**Ordering-key dedup**: when the metadata declares an `ordering_key`, `schedule()`
+is **dedup-by-default** within `(metadata_type, ordering_key)`. If an active
+(`PENDING` or `IN_PROGRESS`) task already exists for the same pair, `schedule()`
+returns that existing task instead of creating a duplicate. This is enforced via
+`TaskRepository::exists_active_by_ordering_key`. Callers do not need to check
+themselves — repeated `schedule()` calls for the same key are safe and idempotent.
+
+This means `ordering_key` carries two meanings:
+1. **Sequential processing** — tasks with the same key never run concurrently.
+2. **Active uniqueness** — at most one active task per `(metadata_type, key)`.
+
+Callers that need ordering without dedup, or dedup without sequential processing,
+should not be added without revisiting this design.
+
 ---
 
 ## Infrastructure

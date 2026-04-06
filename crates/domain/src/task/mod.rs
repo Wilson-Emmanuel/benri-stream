@@ -1,3 +1,4 @@
+pub mod metadata;
 pub mod result;
 pub mod scheduler;
 

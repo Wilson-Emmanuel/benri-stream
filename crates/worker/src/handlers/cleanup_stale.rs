@@ -24,8 +24,8 @@ impl TaskHandler for CleanupStaleHandler {
         match self.use_case.execute().await {
             Ok(stats) => TaskResult::Success {
                 message: Some(format!(
-                    "Cleaned: {} pending, {} stuck, {} failed",
-                    stats.pending_cleaned, stats.stuck_cleaned, stats.failed_cleaned
+                    "Scheduled deletion: {} pending, {} stuck, {} failed",
+                    stats.pending_scheduled, stats.stuck_scheduled, stats.failed_scheduled
                 )),
             },
             Err(e) => TaskResult::RetryableFailure {

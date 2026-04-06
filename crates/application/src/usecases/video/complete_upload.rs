@@ -1,17 +1,29 @@
 use std::sync::Arc;
 
-use domain::ports::storage::StoragePort;
-use domain::ports::video::VideoRepository;
+use domain::ports::storage::{StorageError, StoragePort};
+use domain::ports::unit_of_work::UnitOfWork;
+use domain::ports::video::{RepositoryError, VideoRepository};
+use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
+use domain::task::scheduler::TaskScheduler;
 use domain::video::{VideoId, VideoStatus, MAX_UPLOAD_SIZE_BYTES};
+
+// All supported video formats have their magic bytes within the first 12 bytes.
+// 16 gives a small safety margin without downloading more data than needed.
+const FILE_SIGNATURE_READ_BYTES: u64 = 16;
 
 pub struct CompleteUploadUseCase {
     video_repo: Arc<dyn VideoRepository>,
+    uow: Arc<dyn UnitOfWork>,
     storage: Arc<dyn StoragePort>,
 }
 
 impl CompleteUploadUseCase {
-    pub fn new(video_repo: Arc<dyn VideoRepository>, storage: Arc<dyn StoragePort>) -> Self {
-        Self { video_repo, storage }
+    pub fn new(
+        video_repo: Arc<dyn VideoRepository>,
+        uow: Arc<dyn UnitOfWork>,
+        storage: Arc<dyn StoragePort>,
+    ) -> Self {
+        Self { video_repo, uow, storage }
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
@@ -30,30 +42,58 @@ impl CompleteUploadUseCase {
             .storage
             .head_object(&video.upload_key)
             .await
-            .map_err(|e| Error::Internal(e.to_string()))?
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => Error::FileNotFoundInStorage,
+                other => Error::Internal(other.to_string()),
+            })?
             .ok_or(Error::FileNotFoundInStorage)?;
 
         if metadata.size_bytes > MAX_UPLOAD_SIZE_BYTES {
-            let _ = self.storage.delete_object(&video.upload_key).await;
-            let _ = self.video_repo.delete(&video.id).await;
+            // Schedule immediate deletion. The video row stays in
+            // PENDING_UPLOAD until the DeleteVideo task runs. If the
+            // schedule itself fails, the safety-net sweep (UC-VID-006)
+            // picks it up within 24h — log and still return the user error.
+            if let Err(e) = schedule_delete(&self.uow, &video.id).await {
+                tracing::warn!(
+                    video_id = %video.id,
+                    error = %e,
+                    "failed to schedule DeleteVideo after FileTooLarge rejection; safety-net sweep will collect",
+                );
+            }
             return Err(Error::FileTooLarge);
         }
 
         let header_bytes = self
             .storage
-            .read_range(&video.upload_key, 0, 4095)
+            .read_range(&video.upload_key, 0, FILE_SIGNATURE_READ_BYTES - 1)
             .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => Error::FileNotFoundInStorage,
+                other => Error::Internal(other.to_string()),
+            })?;
 
         if !video.format.validate_signature(&header_bytes) {
-            let _ = self.storage.delete_object(&video.upload_key).await;
-            let _ = self.video_repo.delete(&video.id).await;
+            if let Err(e) = schedule_delete(&self.uow, &video.id).await {
+                tracing::warn!(
+                    video_id = %video.id,
+                    error = %e,
+                    "failed to schedule DeleteVideo after InvalidFileSignature rejection; safety-net sweep will collect",
+                );
+            }
             return Err(Error::InvalidFileSignature);
         }
 
-        let updated = self
-            .video_repo
+        let mut tx = self
+            .uow
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let updated = tx
+            .videos()
             .update_status_if(&video.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        tx.commit()
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
@@ -66,6 +106,25 @@ impl CompleteUploadUseCase {
             status: VideoStatus::Uploaded,
         })
     }
+}
+
+/// Opens a one-shot tx and schedules a `DeleteVideo` task for the given
+/// video. Idempotent at the schedule level — repeated calls for the same
+/// video while a previous task is still active return the existing task
+/// (dedup-by-default via `TaskScheduler`).
+async fn schedule_delete(
+    uow: &Arc<dyn UnitOfWork>,
+    video_id: &VideoId,
+) -> Result<(), RepositoryError> {
+    let mut tx = uow.begin().await?;
+    TaskScheduler::schedule(
+        tx.tasks(),
+        &DeleteVideoTaskMetadata { video_id: video_id.clone() },
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub struct Input {

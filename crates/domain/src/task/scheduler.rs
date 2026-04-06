@@ -1,31 +1,46 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 
-use crate::ports::task::TaskRepository;
+use crate::ports::unit_of_work::TaskMutations;
+use crate::ports::video::RepositoryError;
 use super::{Task, TaskId, TaskMetadata, TaskStatus};
 
-pub struct TaskScheduler {
-    task_repo: Arc<dyn TaskRepository>,
-}
+/// Stateless entry point for creating tasks. Use cases call this inside a
+/// `TxScope` — see `crate::ports::unit_of_work`. Never call `TaskMutations::create`
+/// directly from a use case; always go through `TaskScheduler::schedule`.
+pub struct TaskScheduler;
 
 impl TaskScheduler {
-    pub fn new(task_repo: Arc<dyn TaskRepository>) -> Self {
-        Self { task_repo }
-    }
-
+    /// Schedules a task inside the caller's transaction. When the metadata
+    /// declares an `ordering_key`, this is dedup-by-default: if an active
+    /// (`PENDING` or `IN_PROGRESS`) task already exists for the same
+    /// `(metadata_type, ordering_key)` pair, the existing task is returned
+    /// instead of creating a duplicate. The dedup check runs in the same
+    /// transaction as the subsequent insert — and the database backs it up
+    /// with a partial unique index in case a race slips through.
     pub async fn schedule<M: TaskMetadata>(
-        &self,
+        tasks: &mut dyn TaskMutations,
         metadata: &M,
         trace_id: Option<String>,
-    ) -> Result<Task, crate::ports::video::RepositoryError> {
+    ) -> Result<Task, RepositoryError> {
+        let metadata_type = metadata.metadata_type_name();
+
+        // Dedup-by-default when the metadata declares an ordering key.
+        if let Some(ordering_key) = metadata.ordering_key() {
+            if let Some(existing) = tasks
+                .find_active_by_ordering_key(metadata_type, &ordering_key)
+                .await?
+            {
+                return Ok(existing);
+            }
+        }
+
         let now = Utc::now();
         let metadata_json = serde_json::to_value(metadata)
-            .map_err(|e| crate::ports::video::RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let task = Task {
             id: TaskId::new(),
-            metadata_type: metadata.metadata_type_name().to_string(),
+            metadata_type: metadata_type.to_string(),
             metadata: metadata_json,
             status: TaskStatus::Pending,
             ordering_key: metadata.ordering_key(),
@@ -39,6 +54,6 @@ impl TaskScheduler {
             updated_at: now,
         };
 
-        self.task_repo.create(&task).await
+        tasks.create(&task).await
     }
 }

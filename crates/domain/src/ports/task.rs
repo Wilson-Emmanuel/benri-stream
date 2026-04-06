@@ -4,9 +4,11 @@ use chrono::{DateTime, Utc};
 use crate::task::{Task, TaskId, TaskUpdate};
 use crate::ports::video::RepositoryError;
 
+/// Task repository for worker-internal lifecycle operations. Task creation
+/// from use cases goes through `TaskScheduler` + `TaskMutations` inside a
+/// `TxScope` — see `crate::ports::unit_of_work`.
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
-    async fn create(&self, task: &Task) -> Result<Task, RepositoryError>;
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError>;
     async fn find_by_ids(&self, ids: &[TaskId]) -> Result<Vec<Task>, RepositoryError>;
     async fn find_pending(&self, limit: i32, before: DateTime<Utc>) -> Result<Vec<Task>, RepositoryError>;

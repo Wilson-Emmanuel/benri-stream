@@ -16,7 +16,7 @@ impl PostgresTaskRepository {
     }
 }
 
-fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
+pub(super) fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
     let metadata_str: String = row.get("metadata");
     Task {
         id: TaskId(row.get("id")),
@@ -37,35 +37,6 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
 
 #[async_trait]
 impl TaskRepository for PostgresTaskRepository {
-    async fn create(&self, task: &Task) -> Result<Task, RepositoryError> {
-        let metadata_str = serde_json::to_string(&task.metadata)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        sqlx::query(
-            "INSERT INTO tasks (id, metadata_type, metadata, status, ordering_key, trace_id,
-             attempt_count, next_run_at, error, started_at, completed_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(task.id.0)
-        .bind(&task.metadata_type)
-        .bind(&metadata_str)
-        .bind(task.status.as_str())
-        .bind(&task.ordering_key)
-        .bind(&task.trace_id)
-        .bind(task.attempt_count)
-        .bind(task.next_run_at)
-        .bind(&task.error)
-        .bind(task.started_at)
-        .bind(task.completed_at)
-        .bind(task.created_at)
-        .bind(task.updated_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(task.clone())
-    }
-
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError> {
         sqlx::query("SELECT * FROM tasks WHERE id = $1")
             .bind(id.0)

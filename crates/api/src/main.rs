@@ -13,6 +13,7 @@ use application::usecases::video::{
     initiate_upload::InitiateUploadUseCase,
 };
 use infrastructure::config::AppConfig;
+use infrastructure::postgres::unit_of_work::PgUnitOfWork;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
 use infrastructure::storage::s3_client::S3StorageClient;
 
@@ -61,11 +62,13 @@ async fn main() {
     );
 
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =
-        Arc::new(PostgresVideoRepository::new(pool));
+        Arc::new(PostgresVideoRepository::new(pool.clone()));
+    let uow: Arc<dyn domain::ports::unit_of_work::UnitOfWork> =
+        Arc::new(PgUnitOfWork::new(pool));
 
     let state = AppState {
-        initiate_upload: Arc::new(InitiateUploadUseCase::new(video_repo.clone(), storage.clone())),
-        complete_upload: Arc::new(CompleteUploadUseCase::new(video_repo.clone(), storage.clone())),
+        initiate_upload: Arc::new(InitiateUploadUseCase::new(uow.clone(), storage.clone())),
+        complete_upload: Arc::new(CompleteUploadUseCase::new(video_repo.clone(), uow.clone(), storage.clone())),
         get_video_status: Arc::new(GetVideoStatusUseCase::new(video_repo.clone(), config.base_url.clone())),
         get_video_by_token: Arc::new(GetVideoByTokenUseCase::new(video_repo.clone(), storage.clone())),
     };

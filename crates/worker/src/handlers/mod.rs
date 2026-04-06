@@ -1,5 +1,6 @@
 pub mod process_video;
 pub mod cleanup_stale;
+pub mod delete_video;
 
 use std::collections::HashMap;
 use std::sync::Arc;
