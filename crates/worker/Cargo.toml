@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 domain.workspace = true
 application.workspace = true
-infrastructure.workspace = true
+infrastructure = { workspace = true, features = ["gstreamer"] }
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true

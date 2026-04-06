@@ -33,6 +33,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 nanoid = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 
+gstreamer = "0.23"
+gstreamer-pbutils = "0.23"
+gstreamer-video = "0.23"
+tempfile = "3"
+
 domain = { path = "crates/domain" }
 application = { path = "crates/application" }
 infrastructure = { path = "crates/infrastructure" }

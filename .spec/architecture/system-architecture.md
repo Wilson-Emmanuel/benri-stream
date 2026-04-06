@@ -29,8 +29,9 @@
 Stateless. Reads/writes records in the data store. Issues presigned URLs for storage.
 
 **Worker** — Separate process. Consumes tasks from the message queue, transcodes via
-a pipeline that reads from and writes directly to object storage. No local disk —
-workers are stateless compute. No direct communication with the API server.
+a pipeline that reads from object storage via presigned URL. Segments are buffered
+locally, uploaded to storage as they complete, then deleted. Workers are stateless —
+nothing persists between jobs. No direct communication with the API server.
 
 **Data Store** (e.g., PostgreSQL) — Video records, task records. Source of truth for
 all state.
@@ -98,7 +99,7 @@ The workflow: **spec → implement → test**.
 | Database | PostgreSQL + sqlx                 | Async, compile-time query verification                                  |
 | Migrations | sqlx-cli                          |                                                                         |
 | Object storage | S3-compatible                     | Via `aws-sdk-s3` crate                                                  |
-| Transcoding | GStreamer                         | Via `gstreamer-rs` bindings. Reads from S3, writes to S3. No local disk |
+| Transcoding | GStreamer                         | Via `gstreamer-rs` bindings. Reads from S3, uploads segments to S3 |
 | Frontend | Svelte                            | SPA, two pages                                                          |
 | HLS player | hls.js                            | Browser-side adaptive streaming                                         |
 | CDN | Cloudflare (or similar)           | Free egress, edge caching                                               |

@@ -18,3 +18,14 @@ aws-sdk-s3.workspace = true
 aws-config.workspace = true
 redis.workspace = true
 metrics.workspace = true
+
+# GStreamer is only needed by the worker crate (for transcoding).
+# Gated behind a feature flag so the api crate can skip it entirely.
+gstreamer = { workspace = true, optional = true }
+gstreamer-pbutils = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+default = []
+gstreamer = ["dep:gstreamer", "dep:gstreamer-pbutils", "dep:gstreamer-video", "dep:tempfile"]

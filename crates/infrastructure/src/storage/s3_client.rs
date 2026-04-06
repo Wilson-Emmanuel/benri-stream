@@ -82,6 +82,29 @@ impl StoragePort for S3StorageClient {
             .map_err(|e| StorageError::Internal(e.to_string()))
     }
 
+    async fn upload_from_path(
+        &self,
+        local_path: &std::path::Path,
+        key: &str,
+        content_type: &str,
+    ) -> Result<(), StorageError> {
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(local_path)
+            .await
+            .map_err(|e| StorageError::Internal(format!("failed to read {}: {}", local_path.display(), e)))?;
+
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type(content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
         self.client
             .delete_object()

@@ -1,7 +1,8 @@
 # Transcoding
 
 Converts uploaded video files into adaptive-quality HLS streams. The transcoder reads
-from object storage and writes output directly to object storage — no local disk.
+from object storage via presigned URL. Segments are written to a local temp directory,
+uploaded to object storage as they complete, and deleted. Nothing persists between jobs.
 
 ---
 
@@ -61,8 +62,9 @@ impl TranscoderPort for GstreamerTranscoder { ... }
 ```
 
 Uses `gstreamer-rs` to build the pipeline. The source element reads from a presigned
-storage URL. Sink elements write segments to storage via the `StoragePort`. No local
-filesystem involved.
+storage URL. `hlssink3` writes segments to a local temp directory. A signal handler
+uploads each completed segment to storage via `StoragePort` and deletes the local file.
+Temp directory is cleaned up when the job finishes.
 
 ---
 

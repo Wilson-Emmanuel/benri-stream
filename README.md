@@ -31,7 +31,7 @@ A few things weren't specified. I made assumptions and designed around them.
 **Non-Functional**
 - **Time-to-stream > quality** — video becomes watchable before full processing completes
 - **Horizontal scaling** — stateless workers, scale by adding instances
-- **Cost efficiency** — CDN reduces origin egress, no local disk on workers
+- **Cost efficiency** — CDN reduces origin egress, stateless workers
 
 ### How each requirement is fulfilled
 
@@ -43,7 +43,7 @@ A few things weren't specified. I made assumptions and designed around them.
 | Shareable link | Generated after first segment succeeds — link is guaranteed watchable | [UC-VID-005](.spec/business-spec/video/video.md), [Shareable link decision](#shareable-link-after-first-segment) |
 | Browser streaming | HLS via hls.js (all browsers), native on Safari/iOS | [Frontend SPA](.spec/architecture/frontend/spa.md) |
 | Time-to-stream > quality | Parallel encoding (low finishes first), 4-second segments, progressive status (PARTIAL) | [Parallel encoding decision](#parallel-encoding-over-sequential-passes), [Segment duration decision](#4-second-hls-segments) |
-| Horizontal scaling (bonus) | Stateless workers (no local disk), queue-based task dispatch, distributed lock for poller | [Task system](.spec/architecture/backend/task-system.md) |
+| Horizontal scaling (bonus) | Stateless workers (nothing persists between jobs), queue-based task dispatch, distributed lock for poller | [Task system](.spec/architecture/backend/task-system.md) |
 | Cost efficiency (bonus) | CDN edge-caches segments (origin hit once), presigned URLs bypass API server, original file discarded after processing | [CDN decision](#cdn-as-core-architecture), [Presigned URL decision](#presigned-url-upload) |
 | Consistent playback (bonus) | Adaptive bitrate HLS (3 quality levels), CDN edge serving | [Transcoding](.spec/architecture/backend/transcoding.md) |
 
@@ -66,7 +66,7 @@ Svelte SPA → API Server (Axum) → PostgreSQL ← Worker (GStreamer)
 | Component | Role |
 |-----------|------|
 | **API Server** | Axum (Rust). Upload orchestration, status polling, video metadata. Issues presigned URLs for direct-to-storage uploads. Stateless |
-| **Worker** | Separate process. Consumes tasks from Redis, transcodes via GStreamer reading from and writing directly to S3. No local disk — stateless compute |
+| **Worker** | Separate process. Consumes tasks from queue, transcodes via GStreamer. Segments are buffered locally during transcoding, uploaded to S3 as they complete, then deleted. Nothing persists between jobs — workers are stateless |
 | **PostgreSQL** | Video records, task records. Source of truth for all state |
 | **Redis** | Message queue (List, LPUSH/RPOP) + distributed lock for outbox poller. Ephemeral — DB is the source of truth |
 | **S3 Storage** | Uploaded files (temp) and HLS output (permanent). Presigned URLs for upload. CDN origin |
@@ -118,9 +118,10 @@ prevent long-running tasks from starving shorter ones.
 
 <!-- Replace with rendered diagram image -->
 
-GStreamer reads input from S3 via URL, decodes once, encodes at three quality levels in
-parallel, writes 4-second HLS segments directly back to S3. No local disk — workers are
-stateless compute that scale horizontally.
+GStreamer reads input from S3 via presigned URL, decodes once, encodes at three quality
+levels in parallel, writes 4-second HLS segments to a temp directory. Each completed
+segment is uploaded to S3 and the local file deleted. Workers are stateless — nothing
+persists between jobs.
 
 ---
 
@@ -155,10 +156,11 @@ oversized files at the network level.
 
 GStreamer (via `gstreamer-rs` Rust bindings) instead of shelling out to FFmpeg.
 
-FFmpeg's HLS muxer writes to local filesystem. This forces temp files on the worker
-node, making workers stateful — local disk becomes the scaling bottleneck. GStreamer's
-pipeline model streams from S3 source to S3 sink with no local disk. Workers are pure
-stateless compute.
+FFmpeg is typically invoked by shelling out — spawning a child process, parsing stdout,
+managing lifecycle. GStreamer integrates natively via `gstreamer-rs` with in-process
+pipeline control, signal callbacks when segments complete, and programmatic error
+handling. Both buffer segments locally during transcoding — the difference is integration
+quality, not disk usage.
 
 GStreamer also integrates natively with Rust — the team officially maintains
 `gstreamer-rs` with production-ready bindings. Rust-written plugins ship in official
@@ -261,6 +263,24 @@ Both are capable streaming formats. I went with HLS because it plays natively on
 iOS/Safari with no extra libraries. DASH would need a JavaScript player on iOS. On other
 browsers, hls.js handles HLS playback.
 
+### H.264 video codec
+
+H.264 (via `x264enc`) for all encoded output, even though VP9 and AV1 are royalty-free
+and would be cheaper to ship at scale.
+
+| Codec | Browser support | HLS compatibility | License |
+|-------|----------------|-------------------|---------|
+| **H.264** (chosen) | Universal — every browser, every device | Native HLS spec | Patents (free for streaming) |
+| H.265/HEVC | Safari yes, Chrome partial, Firefox no | HLS supports it but real-world compat is bad | Heavy patents |
+| VP9 | Chrome/Firefox/Edge yes, Safari no for HLS | Not in standard HLS | Royalty-free |
+| AV1 | Newer browsers only, slow encode | Not in standard HLS | Royalty-free |
+
+For our requirement (browser playback via shareable link), H.264 is the only codec that
+works everywhere with HLS. VP9/AV1 would require switching to MPEG-DASH, which loses
+Safari's native HLS support and forces a JavaScript player on iOS. The royalty cost
+for H.264 streaming is zero — patents only apply to encoder/decoder distribution, not
+streaming delivery.
+
 ### Three quality levels (360p, 720p, 1080p)
 
 Covers mobile on bad networks to desktop on fast connections. Two levels would miss
@@ -359,59 +379,36 @@ Workflow: **spec → implement → test**.
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable)
-- [Docker](https://docs.docker.com/get-docker/) (for dependencies below)
-- [Node.js](https://nodejs.org/) (for frontend)
+- [Docker](https://docs.docker.com/get-docker/) with Docker Compose
 
-### 1. Start dependencies
+That's it. Everything (API, worker, frontend, database, queue, storage, CDN) runs in
+containers — no Rust, Node.js, or GStreamer needed on the host.
 
-```bash
-docker compose up -d
-```
-
-This starts all dependencies via Docker Compose:
-
-| Service | Image | Port | Purpose |
-|---------|-------|------|---------|
-| Postgres | `postgres:17` | 5432 | Data store |
-| Redis | `redis:8` | 6379 | Message queue + distributed lock |
-| MinIO | `minio/minio` | 9000 (API), 9001 (console) | S3-compatible object storage |
-| Nginx | `nginx:alpine` | 8888 | CDN simulator — caches HLS segments from MinIO |
-
-MinIO bucket (`benri-stream`) is auto-created with public read access.
-Data persists across restarts via Docker volumes.
-
-### 2. Configure environment
+### Start everything
 
 ```bash
-cp .env.example .env
+docker compose up --build
 ```
 
-Defaults work out of the box with the Docker Compose setup. Edit `.env` if you need
-different ports or credentials.
+First build takes a few minutes (compiling Rust + installing GStreamer plugins).
+Subsequent runs are fast.
 
-### 3. Start the backend
+| Service | Port | Purpose |
+|---------|------|---------|
+| Frontend | http://localhost:5173 | Svelte SPA — upload page and player |
+| API | http://localhost:8080 | Backend HTTP API (proxied via frontend `/api`) |
+| Worker | — | Background transcoder, no exposed port |
+| Postgres | 5432 | Data store |
+| Redis | 6379 | Message queue + distributed lock |
+| MinIO | 9000 (API), 9001 (console) | S3-compatible object storage |
+| CDN | 8888 | Nginx caching segments from MinIO |
 
-```bash
-# Terminal 1 — API server (runs DB migrations on startup)
-source .env && cargo run --bin api
-
-# Terminal 2 — Worker (task consumer, poller, recovery)
-source .env && cargo run --bin worker
-```
-
-### 4. Start the frontend
-
-```bash
-cd frontend
-npm install
-npm run dev    # dev server at http://localhost:5173, proxies /api to localhost:8080
-```
+Open http://localhost:5173 to use the app.
 
 ### Stopping
 
 ```bash
-docker compose down       # stop dependencies (data preserved in volumes)
+docker compose down       # stop everything (data preserved in volumes)
 docker compose down -v    # stop and delete all data
 ```
 
@@ -419,13 +416,13 @@ docker compose down -v    # stop and delete all data
 
 ## Tech Stack
 
-| Concern | Choice | Dev setup |
-|---------|--------|-----------|
+| Concern | Choice | Local container |
+|---------|--------|-----------------|
 | Language | Rust | |
 | Web framework | Axum | |
-| Database | PostgreSQL + sqlx | Postgres 17 via Docker |
-| Storage | S3-compatible (aws-sdk-s3) | MinIO via Docker |
-| Transcoding | GStreamer (gstreamer-rs) | |
-| Message queue | Redis (List as queue) | Redis 8 via Docker |
-| Frontend | Svelte + hls.js | |
-| CDN | Cloudflare (or similar) | Nginx via Docker |
+| Database | PostgreSQL + sqlx | `postgres:17` |
+| Storage | S3-compatible (aws-sdk-s3) | `minio/minio` |
+| Transcoding | GStreamer (gstreamer-rs) | `debian:bookworm-slim` + GStreamer plugins |
+| Message queue | Redis (List as queue) | `redis:8` |
+| Frontend | Svelte + hls.js | `nginx:alpine` (serves built static files) |
+| CDN | Cloudflare (or similar) | `nginx:alpine` (cache simulator) |

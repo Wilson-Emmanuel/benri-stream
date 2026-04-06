@@ -20,6 +20,13 @@ pub trait StoragePort: Send + Sync {
         end: u64,
     ) -> Result<Vec<u8>, StorageError>;
 
+    async fn upload_from_path(
+        &self,
+        local_path: &std::path::Path,
+        key: &str,
+        content_type: &str,
+    ) -> Result<(), StorageError>;
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError>;
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError>;

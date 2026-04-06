@@ -1,0 +1,52 @@
+# Multi-stage build for the worker (transcoder)
+# Stage 1: build
+FROM rust:1.83-bookworm AS builder
+
+WORKDIR /app
+
+# Install GStreamer dev libs and all required plugins for the build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache dependencies separately from source
+COPY Cargo.toml Cargo.lock ./
+COPY crates/domain/Cargo.toml crates/domain/Cargo.toml
+COPY crates/application/Cargo.toml crates/application/Cargo.toml
+COPY crates/infrastructure/Cargo.toml crates/infrastructure/Cargo.toml
+COPY crates/api/Cargo.toml crates/api/Cargo.toml
+COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
+
+RUN mkdir -p crates/domain/src crates/application/src crates/infrastructure/src crates/api/src crates/worker/src && \
+    echo "fn main() {}" > crates/api/src/main.rs && \
+    echo "fn main() {}" > crates/worker/src/main.rs && \
+    touch crates/domain/src/lib.rs crates/application/src/lib.rs crates/infrastructure/src/lib.rs
+
+RUN cargo build --release -p worker || true
+
+# Now copy the real source and build
+COPY crates ./crates
+
+RUN touch crates/worker/src/main.rs && cargo build --release -p worker
+
+# Stage 2: runtime — needs GStreamer plugins for actual transcoding
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    libgstreamer1.0-0 \
+    libgstreamer-plugins-base1.0-0 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/worker /usr/local/bin/worker
+
+CMD ["worker"]
