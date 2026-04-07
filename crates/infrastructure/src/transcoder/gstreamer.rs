@@ -223,6 +223,22 @@ impl GstreamerTranscoder {
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
 
+            // Pin H.264 profile=high, level=4.0 across all tiers. This lets
+            // us put a stable CODECS="avc1.640028,..." attribute in the
+            // master playlist so the player can pick a variant from the
+            // master alone instead of fetching every per-tier playlist
+            // first. High@4.0 fits all our outputs (max 1080p30, ≤25 Mbps).
+            let h264_caps = gst::ElementFactory::make("capsfilter")
+                .property(
+                    "caps",
+                    gst::Caps::builder("video/x-h264")
+                        .field("profile", "high")
+                        .field("level", "4")
+                        .build(),
+                )
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("h264 capsfilter: {e}")))?;
+
             let vparse = gst::ElementFactory::make("h264parse")
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
@@ -243,10 +259,10 @@ impl GstreamerTranscoder {
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink3: {e}")))?;
 
             pipeline
-                .add_many([&vqueue, &vscale, &vcaps, &venc, &vparse, &mux, &hlssink])
+                .add_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse, &mux, &hlssink])
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("add level branch: {e}")))?;
 
-            gst::Element::link_many([&vqueue, &vscale, &vcaps, &venc, &vparse])
+            gst::Element::link_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse])
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("link video chain: {e}")))?;
 
             // vparse → mpegtsmux (request pad)
@@ -461,7 +477,7 @@ impl TranscoderPort for GstreamerTranscoder {
         }
 
         // Generate and upload master playlist
-        let master_content = Self::generate_master_playlist(&quality_levels);
+        let master_content = Self::generate_master_playlist(&quality_levels, has_audio);
         let master_path = temp_path.join("master.m3u8");
         std::fs::write(&master_path, &master_content)
             .map_err(|e| TranscoderError::TranscodeFailed(format!("write master: {e}")))?;
@@ -481,14 +497,31 @@ impl TranscoderPort for GstreamerTranscoder {
 }
 
 impl GstreamerTranscoder {
-    fn generate_master_playlist(levels: &[QualityLevel]) -> String {
-        let mut m3u8 = String::from("#EXTM3U\n");
+    /// Build the HLS master playlist.
+    ///
+    /// Includes a `CODECS=` attribute on each variant so the player can
+    /// pick a variant from the master alone (no need to fetch every
+    /// per-tier playlist first to discover codecs). The codec string is
+    /// stable across tiers because the pipeline pins H.264 to high
+    /// profile, level 4.0 — see the `h264_caps` capsfilter in
+    /// `run_parallel_pipeline`.
+    fn generate_master_playlist(levels: &[QualityLevel], has_audio: bool) -> String {
+        // avc1.640028 = High profile (64), no constraint flags (00),
+        //               level 4.0 (28 hex = 40 dec).
+        // mp4a.40.2   = AAC LC (object type 2 in MP4 audio object types).
+        let codecs = if has_audio {
+            "avc1.640028,mp4a.40.2"
+        } else {
+            "avc1.640028"
+        };
+
+        let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         for level in levels {
             let (width, height) = level.resolution();
             let bitrate = level.target_bitrate_bps();
             m3u8.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{}\n{}/playlist.m3u8\n",
-                bitrate, width, height, level.name()
+                "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{},CODECS=\"{}\"\n{}/playlist.m3u8\n",
+                bitrate, width, height, codecs, level.name()
             ));
         }
         m3u8
