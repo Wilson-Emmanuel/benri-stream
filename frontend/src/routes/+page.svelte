@@ -64,7 +64,7 @@
 			if (result.share_url) {
 				return result.share_url;
 			}
-			if (result.status === 'Failed') {
+			if (result.status === 'FAILED') {
 				throw new Error(result.error_message || 'Processing failed');
 			}
 			await new Promise((r) => setTimeout(r, 5000));

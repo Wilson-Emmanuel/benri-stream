@@ -26,12 +26,12 @@ See use cases below for details on each step.
 | Attribute | Type | Nullable | Description |
 |-----------|------|----------|-------------|
 | `id` | Unique identifier | No | Internal system identifier |
-| `shareToken` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until processing completes successfully. URL-safe |
+| `share_token` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until processing completes successfully. URL-safe |
 | `title` | Text (1–100 chars) | No | User-provided title, displayed on the player page. Frontend pre-fills from filename |
 | `format` | Video Format (see Enums) | No | Determined from MIME type on upload, validated via file signature on complete |
 | `status` | Video Status (see Enums) | No | Current lifecycle state |
-| `uploadKey` | Text | No | Storage key for the uploaded file. Cleared after processing |
-| `createdAt` | Date/time | No | When the upload was initiated |
+| `upload_key` | Text | No | Storage key for the uploaded file. Cleared after processing |
+| `created_at` | Date/time | No | When the upload was initiated |
 
 ### Enums
 
@@ -73,14 +73,14 @@ The client should do basic validation first (file type, size, header check).
 | Field | Required | Description and validation |
 |-------|----------|---------------------------|
 | `title` | Yes | 1–100 chars. Frontend pre-fills from filename |
-| `mimeType` | Yes | Must map to a supported Video Format |
+| `mime_type` | Yes | Must map to a supported Video Format |
 
 **Guards**
 1. Title is not blank and does not exceed 100 chars
 2. MIME type maps to a supported Video Format
 
 **Mutations**
-- Create `Video` with `status = PENDING_UPLOAD`, `format` from MIME type, `shareToken = null`
+- Create `Video` with `status = PENDING_UPLOAD`, `format` from MIME type, `share_token = null`
 - Generate presigned upload URL with 1 GB max size condition (storage-enforced)
 
 **Output**
@@ -88,7 +88,7 @@ The client should do basic validation first (file type, size, header check).
 | Field | Description |
 |-------|-------------|
 | `id` | Video ID (used for polling and completing) |
-| `uploadUrl` | Presigned URL for direct upload to storage (PUT) |
+| `upload_url` | Presigned URL for direct upload to storage (PUT) |
 
 **Error Codes**
 
@@ -186,7 +186,7 @@ Polling endpoint. Returns current status and the shareable link once it's availa
 | Field | Description |
 |-------|-------------|
 | `status` | Current status |
-| `shareUrl` | Full shareable URL. Null until processing completes successfully |
+| `share_url` | Full shareable URL. Null until processing completes successfully |
 
 **Error Codes**
 
@@ -204,7 +204,7 @@ Polling endpoint. Returns current status and the shareable link once it's availa
 
 **Actor**: Anyone with the link
 
-**Triggered by**: REST: `GET /api/videos/share/{shareToken}`
+**Triggered by**: REST: `GET /api/videos/share/{share_token}`
 
 Fetches video metadata and streaming info for the player page.
 
@@ -212,7 +212,7 @@ Fetches video metadata and streaming info for the player page.
 
 | Field | Required | Description and validation |
 |-------|----------|---------------------------|
-| `shareToken` | Yes | Path parameter |
+| `share_token` | Yes | Path parameter |
 
 **Guards**: N/A
 
@@ -223,7 +223,7 @@ Fetches video metadata and streaming info for the player page.
 | Field | Description |
 |-------|-------------|
 | `title` | |
-| `streamUrl` | HLS manifest URL if playable. Null if still processing |
+| `stream_url` | HLS manifest URL if playable. Null if still processing |
 
 **Error Codes**
 
@@ -252,7 +252,7 @@ in a single atomic update.
 
 | Field | Required | Description and validation |
 |-------|----------|---------------------------|
-| `videoId` | Yes | The video to process |
+| `video_id` | Yes | The video to process |
 
 **Guards**
 1. Video exists and status is `UPLOADED`
@@ -262,7 +262,7 @@ in a single atomic update.
 1. Atomically set `status = PROCESSING` (only if still `UPLOADED`). If not, skip — another worker claimed it.
 2. Probe the file — confirm it's a valid, decodable video and capture stream info
 3. Transcode the full video into adaptive HLS, uploading segments to storage
-4. On success → atomically set `shareToken` and `status = PROCESSED` in one statement
+4. On success → atomically set `share_token` and `status = PROCESSED` in one statement
 5. Delete original upload from storage. Best-effort — a failure here leaves
    an orphan that the cleanup safety-net (UC-VID-006) collects.
 
@@ -374,7 +374,7 @@ infrastructure failures.
 
 | Field | Required | Description and validation |
 |-------|----------|---------------------------|
-| `videoId` | Yes | The video to delete |
+| `video_id` | Yes | The video to delete |
 
 **Guards**
 1. Video record exists. If not (already deleted), the task completes as `Skip` —

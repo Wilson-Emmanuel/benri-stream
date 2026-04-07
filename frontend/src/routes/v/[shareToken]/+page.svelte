@@ -14,7 +14,7 @@
 			video = await getVideoByToken(shareToken);
 			if (video.stream_url) {
 				initPlayer(video.stream_url);
-			} else if (video.status === 'Processing') {
+			} else if (video.status === 'PROCESSING' || video.status === 'UPLOADED') {
 				pollUntilReady();
 			}
 		} catch (err) {
@@ -30,7 +30,7 @@
 					clearInterval(interval);
 					initPlayer(video.stream_url);
 				}
-				if (video.status === 'Failed') {
+				if (video.status === 'FAILED') {
 					clearInterval(interval);
 				}
 			} catch (err) {
@@ -71,14 +71,14 @@
 		</div>
 	{:else if !video}
 		<div class="text-center pt-30">Loading...</div>
-	{:else if video.status === 'Failed'}
+	{:else if video.status === 'FAILED'}
 		<div class="text-center pt-30">
 			<h1 class="text-2xl font-semibold mb-4">{video.title}</h1>
 			<p class="text-red-500">
 				{video.error_message || 'This video could not be processed.'}
 			</p>
 		</div>
-	{:else if video.status === 'Processing'}
+	{:else if video.status === 'PROCESSING' || video.status === 'UPLOADED'}
 		<div class="text-center pt-30">
 			<h1 class="text-2xl font-semibold mb-4">{video.title}</h1>
 			<p class="text-neutral-500">Processing... video will be available shortly.</p>

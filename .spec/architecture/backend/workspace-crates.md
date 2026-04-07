@@ -55,7 +55,8 @@ DB migrations. Naming: `[Concept]RepositoryImpl`, `[Concept]Client`.
 
 **api** — Composition root for HTTP.
 Route definitions, request/response DTOs, maps between DTOs and use case types. Wires
-infrastructure impls to port traits at startup.
+infrastructure impls to port traits at startup. Also exposes operational endpoints
+that are not part of the business spec (currently `GET /health` for liveness probes).
 
 **worker** — Composition root for background processing.
 Runs the outbox poller, consumes from the queue, dispatches to handlers, runs stale
