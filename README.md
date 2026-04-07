@@ -116,19 +116,26 @@ prevent long-running tasks from starving shorter ones.
 
 ### GStreamer Pipeline
 
-One pipeline per transcode job. The input is decoded **once**, then a `tee` element
-fans the raw frames out to three encoder branches — one per quality level — each on
-its own thread (via the `queue` right after the tee).
+One pipeline per transcode job. Video is decoded **once**, then a `tee` fans the
+frames to three encoder branches (one per quality level) running on separate threads.
+Audio, when present, is also decoded once, encoded once as AAC, and shared across all
+levels via a second tee — audio quality doesn't change per tier so re-encoding would
+be wasted work.
 
 ```
-uridecodebin → videoconvert → tee ─┬─ queue → videoscale → caps(360p)  → x264enc → h264parse → hlssink3(low)
-                                   ├─ queue → videoscale → caps(720p)  → x264enc → h264parse → hlssink3(med)
-                                   └─ queue → videoscale → caps(1080p) → x264enc → h264parse → hlssink3(high)
+uridecodebin3 ─┬─ videoconvert → video_tee ─┬─ queue → scale(360p)  → x264enc → h264parse ─┐
+               │                            ├─ queue → scale(720p)  → x264enc → h264parse ─┤
+               │                            └─ queue → scale(1080p) → x264enc → h264parse ─┤
+               │                                                                            ├──▶ mpegtsmux ──▶ hlssink3 (per level)
+               └─ audioconvert → audioresample → avenc_aac → aacparse → audio_tee ─────────┘
+                  (only built if the source has an audio stream)
 ```
 
-hlssink3 writes 4-second HLS segments to a local temp directory. Each completed
-segment is uploaded to S3 and the local file deleted. Workers are stateless — nothing
-persists between jobs.
+`uridecodebin3` (stable since GStreamer 1.22) is the modern streams-aware source with
+more accurate HTTP buffering — less over-download from S3 presigned URLs compared to
+the older `uridecodebin`. `hlssink3` writes 4-second HLS segments to a local temp
+directory; each completed segment is uploaded to S3 and the local file deleted.
+Workers are stateless — nothing persists between jobs.
 
 See [transcoding spec](.spec/architecture/backend/transcoding.md) for details on each
 element and the parallelism properties.

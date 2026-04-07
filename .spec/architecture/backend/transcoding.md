@@ -20,29 +20,56 @@ uploaded to object storage as they complete, and deleted. Nothing persists betwe
 
 One GStreamer pipeline per transcode job. The input is decoded once, then a `tee`
 element fans the raw frames to N encoder branches — one per quality level — each
-scheduled on its own thread by the `queue` element right after the tee.
+scheduled on its own thread by the `queue` element right after the tee. Audio, if
+present, is decoded once, encoded once as AAC, and shared across all levels via a
+second tee (audio bitrate doesn't change across tiers, so re-encoding per tier would
+be wasted work).
 
 ```
-uridecodebin → videoconvert → tee ─┬─ queue → videoscale → caps(360p)  → x264enc → h264parse → hlssink3(low)
-                                   ├─ queue → videoscale → caps(720p)  → x264enc → h264parse → hlssink3(med)
-                                   └─ queue → videoscale → caps(1080p) → x264enc → h264parse → hlssink3(high)
+uridecodebin3 ─┬─ videoconvert → video_tee ─┬─ queue → scale(360p)  → x264enc → h264parse ─┐
+               │                            ├─ queue → scale(720p)  → x264enc → h264parse ─┤
+               │                            └─ queue → scale(1080p) → x264enc → h264parse ─┤
+               │                                                                            ├──▶ mpegtsmux(per level) ──▶ hlssink3(per level)
+               └─ audioconvert → audioresample → avenc_aac → aacparse → audio_tee ─────────┘
+                  (only built if the source has an audio stream)
 ```
 
 **Why each element**:
-- **`uridecodebin`** — reads from the presigned storage URL, auto-detects demuxer + decoder
-- **`videoconvert`** — normalizes the decoded frames to a common format before the tee, so all branches see consistent input
-- **`tee`** — fans the decoded stream to N branches. Src pads are requested dynamically (`src_%u`), one per level
-- **`queue`** (after each tee src pad) — critical for parallelism. GStreamer puts each side of a queue on its own streaming thread, so the three encoder branches actually run concurrently
+- **`uridecodebin3`** — modern streams-aware source. Reads from the presigned storage
+  URL, auto-detects demuxer + decoder. Stable since GStreamer 1.22. Preferred over the
+  older `uridecodebin` for more accurate HTTP buffering (less over-download of large
+  source files from S3) and cleaner multi-stream handling.
+- **`videoconvert`** — normalizes decoded frames to a common format before the tee, so
+  all branches see consistent input
+- **`video_tee`** — fans the decoded video stream to N branches. Src pads are requested
+  dynamically (`src_%u`), one per level
+- **`queue`** (after each tee src pad) — critical for parallelism. GStreamer puts each
+  side of a queue on its own streaming thread, so the encoder branches actually run
+  concurrently
 - **`videoscale` + `capsfilter`** — scales to the target resolution per branch
 - **`x264enc`** — H.264 encoder at the per-level target bitrate
-- **`h264parse`** — parses the encoded stream into frames hlssink3 can mux
-- **`hlssink3`** — writes .ts segments and per-level playlist.m3u8 to a local temp dir
+- **`h264parse`** — parses the encoded stream into frames `mpegtsmux` can mux
+- **`audioconvert` + `audioresample`** — normalizes decoded audio to something the
+  encoder will accept
+- **`avenc_aac`** — AAC audio encoder at 128 kbps (shared across all quality tiers)
+- **`aacparse` + `audio_tee`** — parses and fans the encoded AAC out to N muxers
+- **`mpegtsmux`** (one per level) — combines this level's video with the shared audio
+  into an MPEG-TS stream
+- **`hlssink3`** (one per level) — writes .ts segments and per-level `playlist.m3u8`
+  to a local temp dir
 
 Segments are uploaded to object storage as the pipeline produces them, then the
 master `master.m3u8` is generated from the quality level metadata and uploaded.
 
+**Audio handling**: a quick `Discoverer` call before building the pipeline tells us
+whether the source has an audio stream. If yes, we build the audio branch and wire it
+into every level's `mpegtsmux`. If no, we skip the audio branch entirely — `mpegtsmux`
+is fine with video-only input.
+
 **Parallelism properties**:
 - **One decode, N encodes** — the input is read from storage and decoded exactly once
+  (video and audio each once)
+- **Audio encoded once** — not re-encoded per quality tier
 - **Wall-time parallel** — encoders run on separate threads, so total time is bounded
   by the slowest branch (high/1080p), not the sum
 - **Low quality finishes first** — naturally, because low resolution means less
