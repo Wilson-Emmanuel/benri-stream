@@ -12,7 +12,9 @@
     "@sveltejs/adapter-static": "^3.0.0",
     "@sveltejs/kit": "^2.0.0",
     "@sveltejs/vite-plugin-svelte": "^4.0.0",
+    "@tailwindcss/vite": "^4.2.2",
     "svelte": "^5.0.0",
+    "tailwindcss": "^4.2.2",
     "vite": "^6.0.0"
   },
   "dependencies": {

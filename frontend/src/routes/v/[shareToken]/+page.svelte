@@ -62,118 +62,42 @@
 	}
 </script>
 
-<main>
+<main class="max-w-5xl mx-auto px-5 py-10">
 	{#if error}
-		<div class="error-page">
-			<h1>benri-stream</h1>
-			<p class="error">{error}</p>
-			<a href="/">Upload a video</a>
+		<div class="text-center pt-30">
+			<h1 class="text-2xl font-semibold mb-4">benri-stream</h1>
+			<p class="text-red-500">{error}</p>
+			<a href="/" class="text-sky-500 no-underline hover:underline">Upload a video</a>
 		</div>
 	{:else if !video}
-		<div class="loading">Loading...</div>
+		<div class="text-center pt-30">Loading...</div>
 	{:else if video.status === 'Failed'}
-		<div class="error-page">
-			<h1>{video.title}</h1>
-			<p class="error">{video.error_message || 'This video could not be processed.'}</p>
+		<div class="text-center pt-30">
+			<h1 class="text-2xl font-semibold mb-4">{video.title}</h1>
+			<p class="text-red-500">
+				{video.error_message || 'This video could not be processed.'}
+			</p>
 		</div>
 	{:else if video.status === 'Processing'}
-		<div class="processing">
-			<h1>{video.title}</h1>
-			<p>Processing... video will be available shortly.</p>
-			<div class="spinner"></div>
+		<div class="text-center pt-30">
+			<h1 class="text-2xl font-semibold mb-4">{video.title}</h1>
+			<p class="text-neutral-500">Processing... video will be available shortly.</p>
+			<div
+				class="w-8 h-8 border-[3px] border-neutral-800 border-t-sky-500 rounded-full mx-auto my-6 animate-spin"
+			></div>
 		</div>
 	{:else}
-		<div class="player-page">
-			<h1>{video.title}</h1>
-			<div class="player-wrapper">
+		<div>
+			<h1 class="text-2xl font-semibold mb-4">{video.title}</h1>
+			<div class="relative w-full bg-black rounded-lg overflow-hidden">
 				<video
 					bind:this={videoEl}
 					controls
 					autoplay
 					playsinline
+					class="w-full block"
 				></video>
 			</div>
 		</div>
 	{/if}
 </main>
-
-<style>
-	:global(body) {
-		margin: 0;
-		font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-		background: #0a0a0a;
-		color: #e0e0e0;
-	}
-
-	main {
-		max-width: 960px;
-		margin: 0 auto;
-		padding: 40px 20px;
-	}
-
-	h1 {
-		font-size: 1.5rem;
-		font-weight: 600;
-		margin-bottom: 16px;
-	}
-
-	.player-wrapper {
-		position: relative;
-		width: 100%;
-		background: #000;
-		border-radius: 8px;
-		overflow: hidden;
-	}
-
-	video {
-		width: 100%;
-		display: block;
-	}
-
-	.status-note {
-		color: #888;
-		font-size: 0.85rem;
-		margin-top: 8px;
-	}
-
-	.loading, .processing {
-		text-align: center;
-		padding-top: 120px;
-	}
-
-	.processing p {
-		color: #888;
-	}
-
-	.spinner {
-		width: 32px;
-		height: 32px;
-		border: 3px solid #333;
-		border-top-color: #4a9eff;
-		border-radius: 50%;
-		margin: 24px auto;
-		animation: spin 0.8s linear infinite;
-	}
-
-	@keyframes spin {
-		to { transform: rotate(360deg); }
-	}
-
-	.error-page {
-		text-align: center;
-		padding-top: 120px;
-	}
-
-	.error {
-		color: #ff4a4a;
-	}
-
-	a {
-		color: #4a9eff;
-		text-decoration: none;
-	}
-
-	a:hover {
-		text-decoration: underline;
-	}
-</style>

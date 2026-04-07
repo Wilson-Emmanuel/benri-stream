@@ -86,34 +86,53 @@
 	}
 </script>
 
-<main>
-	<h1>benri-stream</h1>
-	<p class="subtitle">Upload a video, get a shareable link.</p>
+<main class="max-w-[540px] mx-auto my-20 px-5">
+	<h1 class="text-3xl font-semibold mb-1">benri-stream</h1>
+	<p class="text-neutral-500 mb-8">Upload a video, get a shareable link.</p>
 
 	{#if status === 'done' && shareUrl}
-		<div class="result">
-			<p>Your video is ready!</p>
-			<div class="link-box">
-				<input type="text" readonly value={shareUrl} />
-				<button onclick={copyLink}>Copy</button>
+		<div class="text-center">
+			<p class="text-xl mb-4">Your video is ready!</p>
+			<div class="flex gap-2 mb-4">
+				<input
+					type="text"
+					readonly
+					value={shareUrl}
+					class="flex-1 p-3 bg-neutral-950 border border-neutral-800 rounded-lg text-neutral-200 text-sm"
+				/>
+				<button
+					onclick={copyLink}
+					class="px-5 py-3 bg-sky-500 text-white border-none rounded-lg cursor-pointer font-medium hover:bg-sky-600"
+				>
+					Copy
+				</button>
 			</div>
-			<button class="secondary" onclick={reset}>Upload another</button>
+			<button
+				onclick={reset}
+				class="bg-transparent border border-neutral-800 text-neutral-500 px-5 py-2.5 rounded-lg cursor-pointer hover:text-neutral-200 hover:border-neutral-600"
+			>
+				Upload another
+			</button>
 		</div>
 	{:else}
 		<div
-			class="drop-zone"
-			class:drag-over={dragOver}
-			ondragover={(e) => { e.preventDefault(); dragOver = true; }}
-			ondragleave={() => dragOver = false}
+			class="border-2 border-dashed rounded-xl px-6 py-12 text-center cursor-pointer transition-colors {dragOver
+				? 'border-sky-500 bg-sky-500/5'
+				: 'border-neutral-800'}"
+			ondragover={(e) => {
+				e.preventDefault();
+				dragOver = true;
+			}}
+			ondragleave={() => (dragOver = false)}
 			ondrop={handleDrop}
 		>
 			{#if file}
-				<p class="file-name">{file.name}</p>
-				<p class="file-size">{(file.size / 1_000_000).toFixed(1)} MB</p>
+				<p class="font-medium break-all">{file.name}</p>
+				<p class="text-neutral-500 text-sm">{(file.size / 1_000_000).toFixed(1)} MB</p>
 			{:else}
 				<p>Drop a video file here</p>
-				<p class="hint">or</p>
-				<label class="file-label">
+				<p class="text-neutral-600 text-sm my-2">or</p>
+				<label class="inline-block px-5 py-2 bg-neutral-900 border border-neutral-800 rounded-md cursor-pointer hover:bg-neutral-800">
 					Browse
 					<input type="file" accept="video/*" onchange={handleFileSelect} hidden />
 				</label>
@@ -122,18 +141,18 @@
 
 		<input
 			type="text"
-			class="title-input"
+			class="w-full px-4 py-3 mt-4 bg-neutral-950 border border-neutral-800 rounded-lg text-neutral-200 text-base box-border"
 			placeholder="Video title"
 			bind:value={title}
 			disabled={status !== 'idle'}
 		/>
 
 		{#if errorMessage}
-			<p class="error">{errorMessage}</p>
+			<p class="text-red-500 text-sm mt-2">{errorMessage}</p>
 		{/if}
 
 		<button
-			class="upload-btn"
+			class="w-full py-3.5 mt-4 bg-sky-500 text-white border-none rounded-lg text-base font-medium cursor-pointer hover:bg-sky-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-sky-500"
 			onclick={handleUpload}
 			disabled={!file || !title.trim() || (status !== 'idle' && status !== 'error')}
 		>
@@ -149,161 +168,3 @@
 		</button>
 	{/if}
 </main>
-
-<style>
-	:global(body) {
-		margin: 0;
-		font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-		background: #0a0a0a;
-		color: #e0e0e0;
-	}
-
-	main {
-		max-width: 540px;
-		margin: 80px auto;
-		padding: 0 20px;
-	}
-
-	h1 {
-		font-size: 2rem;
-		font-weight: 600;
-		margin-bottom: 4px;
-	}
-
-	.subtitle {
-		color: #888;
-		margin-bottom: 32px;
-	}
-
-	.drop-zone {
-		border: 2px dashed #333;
-		border-radius: 12px;
-		padding: 48px 24px;
-		text-align: center;
-		cursor: pointer;
-		transition: border-color 0.2s;
-	}
-
-	.drop-zone.drag-over {
-		border-color: #4a9eff;
-		background: rgba(74, 158, 255, 0.05);
-	}
-
-	.file-name {
-		font-weight: 500;
-		word-break: break-all;
-	}
-
-	.file-size {
-		color: #888;
-		font-size: 0.9rem;
-	}
-
-	.hint {
-		color: #555;
-		font-size: 0.85rem;
-		margin: 8px 0;
-	}
-
-	.file-label {
-		display: inline-block;
-		padding: 8px 20px;
-		background: #1a1a1a;
-		border: 1px solid #333;
-		border-radius: 6px;
-		cursor: pointer;
-	}
-
-	.file-label:hover {
-		background: #222;
-	}
-
-	.title-input {
-		width: 100%;
-		padding: 12px 16px;
-		margin-top: 16px;
-		background: #111;
-		border: 1px solid #333;
-		border-radius: 8px;
-		color: #e0e0e0;
-		font-size: 1rem;
-		box-sizing: border-box;
-	}
-
-	.upload-btn {
-		width: 100%;
-		padding: 14px;
-		margin-top: 16px;
-		background: #4a9eff;
-		color: white;
-		border: none;
-		border-radius: 8px;
-		font-size: 1rem;
-		font-weight: 500;
-		cursor: pointer;
-	}
-
-	.upload-btn:disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
-
-	.upload-btn:hover:not(:disabled) {
-		background: #3a8eef;
-	}
-
-	.error {
-		color: #ff4a4a;
-		font-size: 0.9rem;
-		margin-top: 8px;
-	}
-
-	.result {
-		text-align: center;
-	}
-
-	.result p {
-		font-size: 1.2rem;
-		margin-bottom: 16px;
-	}
-
-	.link-box {
-		display: flex;
-		gap: 8px;
-		margin-bottom: 16px;
-	}
-
-	.link-box input {
-		flex: 1;
-		padding: 12px;
-		background: #111;
-		border: 1px solid #333;
-		border-radius: 8px;
-		color: #e0e0e0;
-		font-size: 0.9rem;
-	}
-
-	.link-box button {
-		padding: 12px 20px;
-		background: #4a9eff;
-		color: white;
-		border: none;
-		border-radius: 8px;
-		cursor: pointer;
-		font-weight: 500;
-	}
-
-	.secondary {
-		background: none;
-		border: 1px solid #333;
-		color: #888;
-		padding: 10px 20px;
-		border-radius: 8px;
-		cursor: pointer;
-	}
-
-	.secondary:hover {
-		color: #e0e0e0;
-		border-color: #555;
-	}
-</style>
