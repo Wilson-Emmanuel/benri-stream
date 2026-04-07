@@ -4,10 +4,9 @@ use crate::ports::unit_of_work::TaskMutations;
 use crate::ports::video::RepositoryError;
 use super::{Task, TaskId, TaskMetadata, TaskStatus};
 
-/// Stateless entry point for creating tasks. Use cases call this inside a
-/// `TxScope` opened via `UnitOfWork::begin` — see `crate::ports::unit_of_work`.
-/// Never call `TaskMutations::create` directly from a use case; always go
-/// through `TaskScheduler::schedule`.
+/// Stateless entry point for creating tasks. Use cases call `schedule()`
+/// inside a `TxScope` opened via `UnitOfWork::begin` — never call
+/// `TaskMutations::create` directly.
 ///
 /// **No deduplication.** Multiple `schedule()` calls for the same logical
 /// task may create multiple rows. Handlers MUST be idempotent (see
@@ -17,18 +16,20 @@ use super::{Task, TaskId, TaskMetadata, TaskStatus};
 pub struct TaskScheduler;
 
 impl TaskScheduler {
-    /// Schedules a task inside the caller's transaction.
+    /// Construct a Task row in the PENDING state without inserting it.
+    /// This is the **single source of truth** for how a TaskMetadata
+    /// becomes a Task row. Both `schedule()` and bulk callers (like the
+    /// cleanup sweep that uses `TaskRepository::bulk_create`) go through
+    /// this helper so they can never drift.
     ///
-    /// `run_at` lets callers schedule a task for a future time. Defaults to
-    /// `now` when `None`.
+    /// `run_at` defaults to `now` when `None`.
     ///
     /// **trace_id**: not currently propagated. The Task is created with
     /// `trace_id: None`. When OpenTelemetry / a tracing-context port is
     /// wired, populate it here from the current span. Until then, the
     /// `trace_id` column on the row stays NULL and worker logs are not
     /// linked back to the originating request.
-    pub async fn schedule<M: TaskMetadata>(
-        tasks: &mut dyn TaskMutations,
+    pub fn build_pending_task<M: TaskMetadata>(
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
     ) -> Result<Task, RepositoryError> {
@@ -36,7 +37,7 @@ impl TaskScheduler {
         let metadata_json = serde_json::to_value(metadata)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let task = Task {
+        Ok(Task {
             id: TaskId::new(),
             metadata_type: metadata.metadata_type_name().to_string(),
             metadata: metadata_json,
@@ -51,8 +52,16 @@ impl TaskScheduler {
             completed_at: None,
             created_at: now,
             updated_at: now,
-        };
+        })
+    }
 
+    /// Schedules a task inside the caller's transaction.
+    pub async fn schedule<M: TaskMetadata>(
+        tasks: &mut dyn TaskMutations,
+        metadata: &M,
+        run_at: Option<DateTime<Utc>>,
+    ) -> Result<Task, RepositoryError> {
+        let task = Self::build_pending_task(metadata, run_at)?;
         tasks.create(&task).await
     }
 }

@@ -62,27 +62,68 @@ impl ProcessVideoUseCase {
             return Ok(());
         }
 
-        // Transcode — the on_first_segment callback generates the share token
-        let uow = self.uow.clone();
-        let video_id = video.id.clone();
+        // Transcode — the on_first_segment callback signals via a oneshot
+        // channel. A sibling task awaits the signal and does the share-token
+        // + Processing→Partial transition. We MUST await the sibling before
+        // doing any post-transcode status updates, otherwise a fast
+        // transcode could finish before the sibling's writes complete and
+        // the post-transcode `update_status_if(Partial → Processed)` would
+        // see the row still in Processing — leaving the video stuck.
+        //
+        // The callback itself is synchronous (called from inside gstreamer's
+        // spawn_blocking pipeline), so it can only fire-and-forget the
+        // signal — it cannot await.
+        let (first_segment_tx, first_segment_rx) = tokio::sync::oneshot::channel::<()>();
+        let on_first_segment = {
+            let mut tx_opt = Some(first_segment_tx);
+            Box::new(move || {
+                if let Some(tx) = tx_opt.take() {
+                    let _ = tx.send(());
+                }
+            })
+        };
 
-        let on_first_segment = Box::new(move || {
-            let uow = uow;
-            let id = video_id;
-            let token = generate_share_token();
+        let signal_writer = {
+            let uow = self.uow.clone();
+            let id = video.id.clone();
             tokio::spawn(async move {
-                let _ = set_share_token(&uow, &id, &token).await;
-                let _ = update_status(&uow, &id, VideoStatus::Processing, VideoStatus::Partial).await;
-                tracing::info!(video_id = %id, "first segment ready, share token generated");
-            });
-        });
+                if first_segment_rx.await.is_ok() {
+                    let token = generate_share_token();
+                    let _ = set_share_token(&uow, &id, &token).await;
+                    let _ = update_status(
+                        &uow,
+                        &id,
+                        VideoStatus::Processing,
+                        VideoStatus::Partial,
+                    )
+                    .await;
+                    tracing::info!(video_id = %id, "first segment ready, share token generated");
+                }
+                // If `first_segment_rx.await` returned `Err`, the sender was
+                // dropped without firing — the transcoder finished without
+                // producing a first-segment callback. Nothing to do.
+            })
+        };
 
         let output_prefix = video.storage_prefix();
-        match self
+        let transcode_result = self
             .transcoder
             .transcode_to_hls(&video.upload_key, &output_prefix, on_first_segment)
-            .await
-        {
+            .await;
+
+        // Wait for the signal writer to drain before any post-transcode
+        // status update. This is the synchronization point that closes the
+        // race window. If the writer panicked, log and continue — the
+        // post-transcode update will still try to do its job.
+        if let Err(e) = signal_writer.await {
+            tracing::error!(
+                video_id = %video.id,
+                error = %e,
+                "first-segment writer task failed",
+            );
+        }
+
+        match transcode_result {
             Ok(result) => {
                 if result.segments_produced > 0 {
                     // All segments produced → PROCESSED. Keep HLS output,

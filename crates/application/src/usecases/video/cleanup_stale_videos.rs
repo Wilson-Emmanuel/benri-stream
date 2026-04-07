@@ -5,7 +5,8 @@ use chrono::Utc;
 use domain::ports::task::TaskRepository;
 use domain::ports::video::VideoRepository;
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
-use domain::task::{Task, TaskId, TaskMetadata, TaskStatus};
+use domain::task::scheduler::TaskScheduler;
+use domain::task::Task;
 use domain::video::{Video, VideoStatus};
 
 /// UC-VID-006 Cleanup Stale Videos — safety-net sweep.
@@ -78,11 +79,20 @@ impl CleanupStaleVideosUseCase {
         }
 
         // Build a DeleteVideo task per qualifying video and bulk-insert.
+        // We use TaskScheduler::build_pending_task so the construction
+        // logic is identical to the single-task `schedule()` path —
+        // no drift if the scheduler grows new fields (e.g. trace_id).
         let to_delete: Vec<&Video> = stale.iter().chain(failed.iter()).collect();
         let tasks: Vec<Task> = to_delete
             .iter()
-            .map(|v| build_delete_task(v))
-            .collect();
+            .map(|v| {
+                TaskScheduler::build_pending_task(
+                    &DeleteVideoTaskMetadata { video_id: v.id.clone() },
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Internal(e.to_string()))?;
 
         if !tasks.is_empty() {
             self.task_repo
@@ -108,34 +118,6 @@ impl CleanupStaleVideosUseCase {
         );
 
         Ok(stats)
-    }
-}
-
-/// Build a `Task` row for a `DeleteVideo` task. Mirrors the construction
-/// in `TaskScheduler::schedule` but in batch form: this caller doesn't go
-/// through the scheduler because the bulk insert path is on
-/// `TaskRepository`, not `TaskMutations`.
-fn build_delete_task(video: &Video) -> Task {
-    let now = Utc::now();
-    let metadata = DeleteVideoTaskMetadata { video_id: video.id.clone() };
-    let metadata_json = serde_json::to_value(&metadata)
-        .expect("DeleteVideoTaskMetadata is always serializable");
-
-    Task {
-        id: TaskId::new(),
-        metadata_type: metadata.metadata_type_name().to_string(),
-        metadata: metadata_json,
-        status: TaskStatus::Pending,
-        ordering_key: metadata.ordering_key(),
-        // TODO: populate from current trace context once OTel is wired.
-        trace_id: None,
-        attempt_count: 0,
-        next_run_at: now,
-        error: None,
-        started_at: None,
-        completed_at: None,
-        created_at: now,
-        updated_at: now,
     }
 }
 

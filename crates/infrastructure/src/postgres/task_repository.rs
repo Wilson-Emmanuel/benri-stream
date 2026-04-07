@@ -58,19 +58,20 @@ impl TaskRepository for PostgresTaskRepository {
 
     /// Returns the next batch of PENDING tasks eligible to run.
     ///
-    /// Respects ordering keys in SQL (previous implementation ignored them):
+    /// Respects ordering keys in SQL:
     /// 1. Tasks without an ordering key are always eligible.
     /// 2. Tasks with an ordering key whose sibling is IN_PROGRESS are skipped.
     /// 3. For tasks with an ordering key, only the oldest per key is returned.
     ///
-    /// Ordered by `next_run_at ASC, id ASC`, capped at `limit`. Two-phase:
-    /// select IDs via CTE, then re-fetch full rows through `row_to_task`.
+    /// Ordered by `next_run_at ASC, id ASC`, capped at `limit`. Single
+    /// query: a CTE selects eligible IDs and the outer SELECT joins to
+    /// fetch full rows in one round trip.
     async fn find_pending(
         &self,
         limit: i32,
         before: DateTime<Utc>,
     ) -> Result<Vec<Task>, RepositoryError> {
-        let id_rows = sqlx::query(
+        sqlx::query(
             r#"
             WITH blocked_keys AS (
                 SELECT DISTINCT ordering_key FROM tasks
@@ -89,55 +90,30 @@ impl TaskRepository for PostgresTaskRepository {
                       )
                   )
             ),
-            one_per_key AS (
-                SELECT DISTINCT ON (ordering_key) id, next_run_at
-                FROM eligible
-                WHERE ordering_key IS NOT NULL
-                ORDER BY ordering_key, next_run_at ASC, id ASC
-            ),
-            no_key AS (
-                SELECT id, next_run_at
-                FROM eligible
-                WHERE ordering_key IS NULL
+            selected AS (
+                SELECT id, next_run_at FROM (
+                    SELECT DISTINCT ON (ordering_key) id, next_run_at
+                    FROM eligible
+                    WHERE ordering_key IS NOT NULL
+                    ORDER BY ordering_key, next_run_at ASC, id ASC
+                    UNION ALL
+                    SELECT id, next_run_at FROM eligible WHERE ordering_key IS NULL
+                ) combined
+                ORDER BY next_run_at ASC, id ASC
+                LIMIT $2
             )
-            SELECT id
-            FROM (
-                SELECT id, next_run_at FROM one_per_key
-                UNION ALL
-                SELECT id, next_run_at FROM no_key
-            ) combined
-            ORDER BY next_run_at ASC, id ASC
-            LIMIT $2
+            SELECT t.*
+            FROM tasks t
+            JOIN selected s ON s.id = t.id
+            ORDER BY s.next_run_at ASC, s.id ASC
             "#,
         )
         .bind(before)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let ids: Vec<uuid::Uuid> = id_rows.into_iter().map(|r| r.get("id")).collect();
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Preserve the order from the CTE result.
-        let rows = sqlx::query("SELECT * FROM tasks WHERE id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut by_id: std::collections::HashMap<uuid::Uuid, Task> = rows
-            .into_iter()
-            .map(|r| {
-                let t = row_to_task(r);
-                (t.id.0, t)
-            })
-            .collect();
-
-        let ordered: Vec<Task> = ids.into_iter().filter_map(|id| by_id.remove(&id)).collect();
-        Ok(ordered)
+        .map(|rows| rows.into_iter().map(row_to_task).collect())
+        .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
     async fn mark_in_progress(

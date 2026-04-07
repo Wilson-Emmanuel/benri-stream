@@ -7,7 +7,7 @@ use tracing::Instrument;
 use domain::ports::task::{TaskConsumer, TaskRepository};
 use domain::task::{Task, TaskId, TaskStatus};
 
-use crate::handlers::TaskHandlerInvoker;
+use crate::handlers::{OutcomeKind, TaskHandlerInvoker};
 
 const EMPTY_POLL_DELAY: Duration = Duration::from_secs(1);
 const POP_ERROR_DELAY: Duration = Duration::from_secs(5);
@@ -102,14 +102,14 @@ impl TaskConsumerLoop {
         // consumer just hands it the task and writes the resulting update.
         let handler = self.handler.clone();
         let task_for_dispatch = task.clone();
-        let update = async move { handler.dispatch(&task_for_dispatch).await }
+        let outcome = async move { handler.dispatch(&task_for_dispatch).await }
             .instrument(span)
             .await;
 
         let metadata_type = task.metadata_type.clone();
-        let outcome_status = update.status;
+        let outcome_kind = outcome.kind;
 
-        if let Err(e) = self.task_repo.batch_update(&[update]).await {
+        if let Err(e) = self.task_repo.batch_update(&[outcome.update]).await {
             tracing::error!(
                 task_id = %task.id,
                 error = %e,
@@ -117,23 +117,23 @@ impl TaskConsumerLoop {
             );
         }
 
-        // Metrics by terminal outcome. Skip / Terminate are folded into
-        // succeeded since both end at COMPLETED.
-        match outcome_status {
-            TaskStatus::Completed => {
+        // Metric labeling derives from the typed outcome kind, NOT from
+        // update.status. update.status is ambiguous (`Pending` could be
+        // either a successful recurring reschedule OR a retry from
+        // failure). The dispatcher knows the original TaskResult variant
+        // and produces the correct OutcomeKind in one place.
+        match outcome_kind {
+            OutcomeKind::Success => {
                 metrics::counter!("task.succeeded", "metadata_type" => metadata_type)
                     .increment(1);
             }
-            TaskStatus::DeadLetter => {
+            OutcomeKind::Failed => {
                 metrics::counter!("task.failed", "metadata_type" => metadata_type)
                     .increment(1);
             }
-            TaskStatus::Pending => {
+            OutcomeKind::Retried => {
                 metrics::counter!("task.retried", "metadata_type" => metadata_type)
                     .increment(1);
-            }
-            TaskStatus::InProgress => {
-                // Should never happen — compute_update never produces InProgress.
             }
         }
     }

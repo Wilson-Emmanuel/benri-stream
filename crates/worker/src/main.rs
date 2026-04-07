@@ -173,8 +173,44 @@ async fn main() {
     tracing::info!("shutdown signal received, draining workers");
     let _ = shutdown_tx.send(true);
 
-    let _ = tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
+    let (consumer_result, poller_result, recovery_result, checker_result) =
+        tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
+
+    // Surface any panics. tokio::spawn catches panics into the JoinHandle
+    // so the runtime stays alive, but if we ignored these errors a
+    // panicked component would die silently and the worker would keep
+    // running with one fewer component. Logging here makes the failure
+    // visible at process exit time at minimum; future work could add a
+    // supervisor that restarts the failed component during runtime.
+    log_join_result("consumer", consumer_result);
+    log_join_result("poller", poller_result);
+    log_join_result("recovery", recovery_result);
+    log_join_result("system_checker", checker_result);
+
     tracing::info!("Worker stopped");
+}
+
+fn log_join_result(component: &str, result: Result<(), tokio::task::JoinError>) {
+    match result {
+        Ok(()) => {}
+        Err(e) if e.is_panic() => {
+            let panic_msg = panic_message(e.into_panic());
+            tracing::error!(component, panic = %panic_msg, "worker component panicked");
+        }
+        Err(e) => {
+            tracing::warn!(component, error = %e, "worker component cancelled");
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 #[cfg(unix)]
