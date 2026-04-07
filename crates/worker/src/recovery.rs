@@ -60,6 +60,10 @@ impl StaleRecovery {
 
         let reset_result = self.task_repo.reset_stale().await.map_err(|e| e.to_string());
 
+        // If `reset_stale` panics, the lock release is skipped and the
+        // lock waits out its TTL (LOCK_TTL_SECS). Acceptable: stale
+        // recovery only runs once per RECOVERY_INTERVAL anyway, and
+        // another instance picks up on the next cycle.
         let _ = self.lock.release(LOCK_KEY, &token).await;
 
         reset_result.map(|_| ())

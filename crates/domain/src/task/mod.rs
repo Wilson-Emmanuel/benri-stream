@@ -50,26 +50,41 @@ pub struct Task {
 const MAX_RETRY_BACKOFF_SECS: i64 = 30 * 60;
 const MAX_BACKOFF_EXPONENT: i32 = 10;
 
+/// What a single task run produced: the DB row update plus the
+/// caller-facing summary of which `TaskResult` variant was hit (used
+/// for metric labeling).
+///
+/// `compute_update` produces both atomically so the metric label
+/// cannot drift from the actual outcome — there's a single match
+/// statement and each branch fixes both fields.
+#[derive(Debug, Clone)]
+pub struct TaskRunOutcome {
+    pub update: TaskUpdate,
+    pub kind: result::OutcomeKind,
+}
+
 impl Task {
-    /// Pure function: given the typed metadata and a `TaskResult`, compute
-    /// the `TaskUpdate` representing the next DB state. No side effects, no
-    /// DB access.
+    /// Pure function: given the typed metadata and a `TaskResult`,
+    /// compute the next DB state and the outcome classification. No
+    /// side effects, no DB access.
     ///
-    /// Generic over `M: TaskMetadata` because the per-task scheduling config
-    /// (max retries, base delay, interval) lives on the trait, not on the row.
-    /// The caller (typically `HandlerAdapter`) is responsible for
-    /// deserializing the typed metadata from `task.metadata` and passing it.
+    /// Generic over `M: TaskMetadata` because the per-task scheduling
+    /// config (max retries, base delay, interval) lives on the trait,
+    /// not on the row. The caller (typically `HandlerAdapter`) is
+    /// responsible for deserializing the typed metadata from
+    /// `task.metadata` and passing it.
     ///
-    /// Note: `Skip` and `Terminate` outcomes write their reason into the
-    /// `error` column prefixed with `"Skipped: "` / `"Terminated: "`. The
-    /// `error` column doubles as a "last message" channel since there's no
-    /// dedicated last-message column. Filter on the prefix when querying
-    /// for actual failures.
+    /// Note: `Skip` and `Terminate` outcomes write their reason into
+    /// the `error` column prefixed with `"Skipped: "` / `"Terminated: "`.
+    /// The `error` column doubles as a "last message" channel since
+    /// there's no dedicated last-message column. Filter on the prefix
+    /// when querying for actual failures.
     pub fn compute_update<M: TaskMetadata>(
         &self,
         metadata: &M,
         result: &result::TaskResult,
-    ) -> TaskUpdate {
+    ) -> TaskRunOutcome {
+        use result::OutcomeKind;
         let now = Utc::now();
         match result {
             result::TaskResult::Success { reschedule_after, .. } => {
@@ -81,7 +96,7 @@ impl Task {
                             .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64))
                     });
 
-                if let Some(next) = next_run_at {
+                let update = if let Some(next) = next_run_at {
                     // Recurring task → reschedule.
                     TaskUpdate {
                         task_id: self.id.clone(),
@@ -103,7 +118,8 @@ impl Task {
                         completed_at: Some(now),
                         updated_at: now,
                     }
-                }
+                };
+                TaskRunOutcome { update, kind: OutcomeKind::Success }
             }
 
             result::TaskResult::RetryableFailure { error, retry_after } => {
@@ -114,7 +130,7 @@ impl Task {
                 };
 
                 if !can_retry {
-                    TaskUpdate {
+                    let update = TaskUpdate {
                         task_id: self.id.clone(),
                         status: TaskStatus::DeadLetter,
                         attempt_count: new_attempt,
@@ -122,12 +138,13 @@ impl Task {
                         error: Some(error.clone()),
                         completed_at: Some(now),
                         updated_at: now,
-                    }
+                    };
+                    TaskRunOutcome { update, kind: OutcomeKind::Failed }
                 } else {
                     let delay = retry_after
                         .map(|d| chrono::Duration::milliseconds(d.as_millis() as i64))
                         .unwrap_or_else(|| calculate_retry_delay(metadata, self.attempt_count));
-                    TaskUpdate {
+                    let update = TaskUpdate {
                         task_id: self.id.clone(),
                         status: TaskStatus::Pending,
                         attempt_count: new_attempt,
@@ -135,23 +152,27 @@ impl Task {
                         error: Some(error.clone()),
                         completed_at: None,
                         updated_at: now,
-                    }
+                    };
+                    TaskRunOutcome { update, kind: OutcomeKind::Retried }
                 }
             }
 
-            result::TaskResult::PermanentFailure { error } => TaskUpdate {
-                task_id: self.id.clone(),
-                status: TaskStatus::DeadLetter,
-                attempt_count: self.attempt_count,
-                next_run_at: None,
-                error: Some(error.clone()),
-                completed_at: Some(now),
-                updated_at: now,
-            },
+            result::TaskResult::PermanentFailure { error } => {
+                let update = TaskUpdate {
+                    task_id: self.id.clone(),
+                    status: TaskStatus::DeadLetter,
+                    attempt_count: self.attempt_count,
+                    next_run_at: None,
+                    error: Some(error.clone()),
+                    completed_at: Some(now),
+                    updated_at: now,
+                };
+                TaskRunOutcome { update, kind: OutcomeKind::Failed }
+            }
 
             result::TaskResult::Skip { reason } => {
                 // Recurring tasks reschedule on skip; one-shot → Completed.
-                if let Some(interval) = metadata.execution_interval() {
+                let update = if let Some(interval) = metadata.execution_interval() {
                     TaskUpdate {
                         task_id: self.id.clone(),
                         status: TaskStatus::Pending,
@@ -173,18 +194,22 @@ impl Task {
                         completed_at: Some(now),
                         updated_at: now,
                     }
-                }
+                };
+                TaskRunOutcome { update, kind: OutcomeKind::Success }
             }
 
-            result::TaskResult::Terminate { reason } => TaskUpdate {
-                task_id: self.id.clone(),
-                status: TaskStatus::Completed,
-                attempt_count: self.attempt_count,
-                next_run_at: None,
-                error: Some(format!("Terminated: {}", reason)),
-                completed_at: Some(now),
-                updated_at: now,
-            },
+            result::TaskResult::Terminate { reason } => {
+                let update = TaskUpdate {
+                    task_id: self.id.clone(),
+                    status: TaskStatus::Completed,
+                    attempt_count: self.attempt_count,
+                    next_run_at: None,
+                    error: Some(format!("Terminated: {}", reason)),
+                    completed_at: Some(now),
+                    updated_at: now,
+                };
+                TaskRunOutcome { update, kind: OutcomeKind::Success }
+            }
         }
     }
 }

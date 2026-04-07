@@ -1,5 +1,28 @@
 use std::time::Duration;
 
+/// What `Task::compute_update` decided about a task run, summarized for
+/// metric labeling. Derived directly from the original `TaskResult`
+/// variant plus retry state — **not** from `TaskUpdate.status`, which
+/// is ambiguous (`Pending` can mean either a successful recurring
+/// reschedule OR a retry-after-failure).
+///
+/// Lives next to `TaskResult` because the two are computed together
+/// in one place (`compute_update`) and the `OutcomeKind` is the
+/// caller-facing summary of which variant was hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    /// Handler completed successfully (one-shot or recurring), or chose
+    /// to skip on this run, or terminated a recurring task. None of
+    /// these are failures.
+    Success,
+    /// Handler returned `RetryableFailure` and retries remain — the
+    /// task will be re-attempted.
+    Retried,
+    /// Permanent failure: `PermanentFailure`, retries exhausted, bad
+    /// metadata, or no handler registered.
+    Failed,
+}
+
 /// Result of task execution returned by task handlers. Controls the state
 /// transition computed by `Task::compute_update`.
 #[derive(Debug, Clone)]

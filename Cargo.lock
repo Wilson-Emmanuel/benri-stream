@@ -49,10 +49,7 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "application",
- "aws-config",
- "aws-sdk-s3",
  "axum",
- "chrono",
  "domain",
  "infrastructure",
  "serde",
@@ -4168,8 +4165,6 @@ version = "0.1.0"
 dependencies = [
  "application",
  "async-trait",
- "aws-config",
- "aws-sdk-s3",
  "chrono",
  "domain",
  "infrastructure",
@@ -4180,7 +4175,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

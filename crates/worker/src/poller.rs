@@ -58,6 +58,12 @@ impl OutboxPoller {
             None => return Ok(()),
         };
 
+        // The release runs on the normal Ok/Err path. If `do_poll` panics
+        // the release is skipped and the lock waits out the TTL — short
+        // enough (LOCK_TTL_SECS) that another instance picks up on the
+        // next interval. A drop-guard would be tidier but mixing async
+        // release with sync `Drop` is awkward; the TTL fallback is the
+        // standard pattern for Redis locks of this style.
         let result = self.do_poll().await;
         let _ = self.lock.release(LOCK_KEY, &token).await;
         result

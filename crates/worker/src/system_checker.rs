@@ -64,6 +64,10 @@ impl SystemTaskChecker {
             None => return Ok(()),
         };
 
+        // A panic inside `do_check` skips the release and waits out the
+        // lock TTL (LOCK_TTL_SECS). Acceptable: the system task checker
+        // runs every CHECK_INTERVAL and another instance picks up on
+        // the next cycle.
         let result = self.do_check().await;
         let _ = self.lock.release(LOCK_KEY, &token).await;
         result

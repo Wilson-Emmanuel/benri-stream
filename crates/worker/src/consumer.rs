@@ -5,9 +5,10 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 use domain::ports::task::{TaskConsumer, TaskRepository};
+use domain::task::result::OutcomeKind;
 use domain::task::{Task, TaskId, TaskStatus};
 
-use crate::handlers::{OutcomeKind, TaskHandlerInvoker};
+use crate::handlers::TaskHandlerInvoker;
 
 const EMPTY_POLL_DELAY: Duration = Duration::from_secs(1);
 const POP_ERROR_DELAY: Duration = Duration::from_secs(5);

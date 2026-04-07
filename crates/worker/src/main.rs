@@ -7,7 +7,6 @@ mod handlers;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
 use tokio::sync::watch;
 
@@ -19,6 +18,7 @@ use application::usecases::video::{
 use domain::task::metadata::cleanup_stale_videos::CleanupStaleVideosTaskMetadata;
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
 use domain::task::metadata::process_video::ProcessVideoTaskMetadata;
+use infrastructure::bootstrap::{create_pg_pool, create_redis_client, create_s3_client};
 use infrastructure::config::AppConfig;
 use infrastructure::postgres::transaction::PgTransactionPort;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
@@ -47,24 +47,12 @@ async fn main() {
     let config = AppConfig::from_env();
 
     tracing::info!("worker: connecting to database");
-    // Database
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&config.database_url)
+    let pool = create_pg_pool(&config.database_url, 5)
         .await
         .expect("Failed to connect to database");
     tracing::info!("worker: database connected");
 
-    // S3
-    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(config.s3_region.clone()));
-    let aws_config = if let Some(endpoint) = &config.s3_endpoint {
-        aws_config.endpoint_url(endpoint).load().await
-    } else {
-        aws_config.load().await
-    };
-    let s3_client = aws_sdk_s3::Client::new(&aws_config);
-
+    let s3_client = create_s3_client(&config).await;
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(
         S3StorageClient::new(
             s3_client,
@@ -74,10 +62,8 @@ async fn main() {
         ),
     );
 
-    // Redis
     tracing::info!("worker: connecting to redis");
-    let redis_client =
-        redis::Client::open(config.redis_url.as_str()).expect("Invalid Redis URL");
+    let redis_client = create_redis_client(&config.redis_url).expect("Invalid Redis URL");
 
     // Repositories + TransactionPort
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =
@@ -173,10 +159,14 @@ async fn main() {
     });
 
     // Wait for SIGINT / SIGTERM, then broadcast shutdown and wait for all
-    // components to drain.
+    // components to drain. A second signal during the drain forces an
+    // immediate exit so an operator can kill a worker stuck inside a
+    // long-running handler (e.g. transcoding) without having to find
+    // the PID and SIGKILL it manually.
     wait_for_shutdown().await;
     tracing::info!("shutdown signal received, draining workers");
     let _ = shutdown_tx.send(true);
+    spawn_force_exit_on_second_signal();
 
     let (consumer_result, poller_result, recovery_result, checker_result) =
         tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
@@ -231,4 +221,16 @@ async fn wait_for_shutdown() {
 #[cfg(not(unix))]
 async fn wait_for_shutdown() {
     let _ = signal::ctrl_c().await;
+}
+
+/// After the first shutdown signal has triggered the graceful drain,
+/// install a background watcher that forces an immediate exit on the
+/// next signal. Standard exit code 130 (128 + SIGINT) so process
+/// supervisors recognize it as "killed by operator."
+fn spawn_force_exit_on_second_signal() {
+    tokio::spawn(async move {
+        wait_for_shutdown().await;
+        tracing::error!("second shutdown signal received — forcing immediate exit");
+        std::process::exit(130);
+    });
 }

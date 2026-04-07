@@ -1,7 +1,6 @@
 mod handlers;
 
 use axum::{routing::{get, post}, Router};
-use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -12,6 +11,7 @@ use application::usecases::video::{
     get_video_status::GetVideoStatusUseCase,
     initiate_upload::InitiateUploadUseCase,
 };
+use infrastructure::bootstrap::{create_pg_pool, create_s3_client};
 use infrastructure::config::AppConfig;
 use infrastructure::postgres::task_repository::PostgresTaskRepository;
 use infrastructure::postgres::transaction::PgTransactionPort;
@@ -39,9 +39,7 @@ async fn main() {
     let config = AppConfig::from_env();
 
     tracing::info!("api: connecting to database");
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
+    let pool = create_pg_pool(&config.database_url, 10)
         .await
         .expect("Failed to connect to database");
 
@@ -52,15 +50,7 @@ async fn main() {
         .expect("Failed to run migrations");
     tracing::info!("api: migrations applied");
 
-    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(config.s3_region.clone()));
-    let aws_config = if let Some(endpoint) = &config.s3_endpoint {
-        aws_config.endpoint_url(endpoint).load().await
-    } else {
-        aws_config.load().await
-    };
-    let s3_client = aws_sdk_s3::Client::new(&aws_config);
-
+    let s3_client = create_s3_client(&config).await;
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(
         S3StorageClient::new(
             s3_client,
