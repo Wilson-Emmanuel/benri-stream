@@ -45,7 +45,8 @@ happen in production, it's a `Result`, not a `panic!`.
 
 | What | Crate | Path |
 |------|-------|------|
-| Port error types (e.g., `RepositoryError`) | `domain` | `src/ports/*.rs` (alongside each port trait) |
+| Shared port error type (`RepositoryError`) | `domain` | `src/ports/error.rs` |
+| Port-specific error types (e.g., `StorageError`, `TranscoderError`) | `domain` | `src/ports/*.rs` (alongside each port trait) |
 | Use case error enums | `application` | `src/usecases/*/[use_case].rs` (nested in each use case) |
 | HTTP error mapping | `api` | `src/handlers/*.rs` (in each handler function) |
 | Task result mapping | `worker` | `src/handlers/*_handler.rs` (in each task handler) |

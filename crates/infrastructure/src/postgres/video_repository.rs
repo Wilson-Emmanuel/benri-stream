@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
-use domain::ports::video::{RepositoryError, VideoRepository};
+use domain::ports::error::RepositoryError;
+use domain::ports::video::VideoRepository;
 use domain::video::{Video, VideoFormat, VideoId, VideoStatus};
 
 pub struct PostgresVideoRepository {

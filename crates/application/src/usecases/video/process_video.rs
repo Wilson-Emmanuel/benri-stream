@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use domain::ports::error::RepositoryError;
 use domain::ports::storage::StoragePort;
 use domain::ports::transaction::TransactionPort;
 use domain::ports::transcoder::TranscoderPort;
-use domain::ports::video::{RepositoryError, VideoRepository};
+use domain::ports::video::VideoRepository;
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
 use domain::video::{generate_share_token, Video, VideoId, VideoStatus};

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use crate::ports::error::RepositoryError;
 use crate::video::{Video, VideoId, VideoStatus};
 
 /// Pool-backed video operations. These are single-statement writes and
@@ -55,10 +56,4 @@ pub trait VideoRepository: Send + Sync {
         ids: &[VideoId],
         from_statuses: &[VideoStatus],
     ) -> Result<(), RepositoryError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RepositoryError {
-    #[error("database error: {0}")]
-    Database(String),
 }

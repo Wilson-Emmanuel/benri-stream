@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::ports::video::RepositoryError;
+use crate::ports::error::RepositoryError;
 use crate::task::Task;
 use crate::video::{VideoId, VideoStatus};
 
@@ -64,9 +64,10 @@ pub trait TxScope: Send {
 }
 
 /// Transactional video mutations — only the ones that actually need to be
-/// bundled with other writes. Single-op video writes (`insert`,
-/// `set_share_token`, `delete`) live on the pool-backed
-/// [`VideoRepository`](crate::ports::video::VideoRepository) instead.
+/// bundled with other writes. Single-op video writes (`insert`, `delete`,
+/// `update_status_if`, `mark_processed`) live on the pool-backed
+/// [`VideoRepository`](crate::ports::video::VideoRepository) and run as
+/// plain single-statement updates without an enclosing transaction.
 #[async_trait]
 pub trait VideoMutations: Send {
     /// Atomically set status only if current status matches `expected`.

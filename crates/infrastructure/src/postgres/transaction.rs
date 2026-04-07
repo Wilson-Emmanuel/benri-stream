@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, Transaction};
 
+use domain::ports::error::RepositoryError;
 use domain::ports::transaction::{
     TaskMutations, TransactionPort, TxClosure, TxScope, VideoMutations,
 };
-use domain::ports::video::RepositoryError;
 use domain::task::Task;
 use domain::video::{VideoId, VideoStatus};
 

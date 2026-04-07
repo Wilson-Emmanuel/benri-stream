@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
+use domain::ports::error::RepositoryError;
 use domain::ports::task::TaskRepository;
-use domain::ports::video::RepositoryError;
 use domain::task::{Task, TaskId, TaskStatus, TaskUpdate};
 
 pub struct PostgresTaskRepository {

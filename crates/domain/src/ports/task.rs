@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use crate::ports::error::RepositoryError;
 use crate::task::{Task, TaskId, TaskUpdate};
-use crate::ports::video::RepositoryError;
 
 /// Pool-backed task operations. Reads, lifecycle management, and single
 /// or bulk inserts that don't need to be bundled with other writes.

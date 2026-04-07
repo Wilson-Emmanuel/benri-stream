@@ -115,7 +115,7 @@ detects it and skips.
 |------|-------|------|
 | `VideoRepository` trait | `domain` | `src/ports/video.rs` |
 | `TaskRepository` trait | `domain` | `src/ports/task.rs` |
-| `RepositoryError` | `domain` | `src/ports/video.rs` (shared across repos) |
+| `RepositoryError` | `domain` | `src/ports/error.rs` (shared across repository ports) |
 | `PostgresVideoRepository` | `infrastructure` | `src/postgres/video_repository.rs` |
 | `PostgresTaskRepository` | `infrastructure` | `src/postgres/task_repository.rs` |
 | Row mapping helpers | `infrastructure` | `src/postgres/*.rs` (in each repo file) |
