@@ -1,30 +1,37 @@
 # Storage
 
-S3-compatible object storage for uploaded files, transcoded HLS output, and presigned
-URL uploads.
+S3-compatible object storage split across two buckets: a private upload
+bucket for original files (read by the worker only) and a public-read
+output bucket for HLS manifests and segments (fronted by the CDN).
 
 ---
 
 ## Object Layout
 
-```
-uploads/
-  {video_id}/original.{ext}         <- temp, deleted after processing
+Two buckets, one prefix each. Keys still carry the prefix even though
+the bucket name already implies it — the prefix is what the storage
+adapter routes on, so domain code stays unaware of the bucket split.
 
-videos/
-  {video_id}/
-    master.m3u8                      <- HLS master playlist (multi-variant)
-    low/
-      playlist.m3u8                  <- per-tier playlist
-      segment_000.m4s               <- fragmented MP4 segments
-      segment_001.m4s
-      ...
-    medium/
-      playlist.m3u8
-      ...
-    high/
-      playlist.m3u8
-      ...
+```
+benri-uploads/                       <- private bucket
+  uploads/
+    {video_id}/original.{ext}        <- deleted after processing
+
+benri-stream/                        <- public-read bucket (CDN origin)
+  videos/
+    {video_id}/
+      master.m3u8                    <- HLS master playlist (multi-variant)
+      low/
+        playlist.m3u8                <- per-tier playlist
+        segment_000.ts               <- MPEG-TS segments
+        segment_001.ts
+        ...
+      medium/
+        playlist.m3u8
+        ...
+      high/
+        playlist.m3u8
+        ...
 ```
 
 ---
@@ -51,17 +58,34 @@ pub trait StoragePort: Send + Sync {
 **Implementation** (infrastructure):
 ```rust
 // crates/infrastructure/src/storage/s3_client.rs
-pub struct S3StorageClient { client: aws_sdk_s3::Client, bucket: String, cdn_base_url: String }
+pub struct S3StorageClient {
+    client: aws_sdk_s3::Client,
+    upload_bucket: String,   // private; uploads/...
+    output_bucket: String,   // public-read; videos/...
+    cdn_base_url: String,
+}
 impl StoragePort for S3StorageClient { ... }
 ```
+
+The adapter holds both buckets and routes per call by inspecting the
+key prefix (`uploads/` → upload bucket, `videos/` → output bucket).
+A `bucket_for(key)` helper does the dispatch and panics on unknown
+prefixes (programming bug, not a runtime condition).
 
 ---
 
 ## Configuration
 
+The adapter holds two bucket names and routes by key prefix:
+`uploads/...` keys go to the upload bucket, `videos/...` keys go to
+the output bucket. The split keeps the public-read surface (HLS output)
+fully separated from the private surface (original uploads), with
+independent access policies, lifecycle rules, and metrics.
+
 | Config | Env var | Description |
 |--------|---------|-------------|
-| Bucket name | `S3_BUCKET` | Where all objects live |
+| Upload bucket | `S3_UPLOAD_BUCKET` | Private bucket for `uploads/{id}/...`. Worker reads via short-lived presigned GET URLs. |
+| Output bucket | `S3_OUTPUT_BUCKET` | Public-read bucket for `videos/{id}/...`. Fronted by the CDN. |
 | Region | `S3_REGION` | S3 region |
 | Endpoint | `S3_ENDPOINT` | Custom endpoint for S3-compatible providers (MinIO, etc.) |
 | CDN base URL | `CDN_BASE_URL` | Prefix for public URLs resolved by `public_url()` |
@@ -78,5 +102,5 @@ in `api/src/main.rs` and `worker/src/main.rs`.
 | `StoragePort` trait | `domain` | `src/ports/storage.rs` |
 | `StorageError`, `PresignedUpload`, `ObjectMetadata` | `domain` | `src/ports/storage.rs` |
 | `S3StorageClient` implementation | `infrastructure` | `src/storage/s3_client.rs` |
-| Config (bucket, region, endpoint, CDN URL) | `infrastructure` | `src/config.rs` |
+| Config (upload + output buckets, region, endpoint, CDN URL) | `infrastructure` | `src/config.rs` |
 | Wiring (construct client, pass to use cases) | `api`, `worker` | `src/main.rs` |

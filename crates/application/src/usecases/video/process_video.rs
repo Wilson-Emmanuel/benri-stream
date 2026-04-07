@@ -18,7 +18,7 @@ use domain::video::{generate_share_token, Video, VideoId, VideoStatus};
 ///
 /// Probe + the upload-time validations (client-side type/size check, server
 /// magic-byte signature check) provide strong evidence the file is good
-/// before we start transcoding. We don't try to be partially-resilient on
+/// before transcoding starts. There is no partial-resilience path on
 /// transcode failures: if the pipeline errors out, the whole video is
 /// marked failed and scheduled for deletion.
 pub struct ProcessVideoUseCase {
@@ -90,9 +90,9 @@ impl ProcessVideoUseCase {
                 tracing::info!(video_id = %video.id, "processing complete");
             }
             Ok(false) => {
-                // Status was no longer Processing — recovered out from
-                // under us by something else (e.g. safety-net sweep).
-                // The other path owns the row's lifecycle, nothing to do.
+                // Status was no longer Processing — another path
+                // (e.g. safety-net sweep) already recovered the row.
+                // That path owns the lifecycle from here, nothing to do.
                 tracing::warn!(
                     video_id = %video.id,
                     "mark_processed found no row in Processing state",
@@ -100,11 +100,12 @@ impl ProcessVideoUseCase {
             }
             Err(e) => {
                 // The transcode succeeded and segments are uploaded, but
-                // we couldn't flip the status to Processed (transient DB
-                // error?). If we leave the row in Processing, the safety
-                // net would mark it Failed in 24h and DeleteVideo would
-                // delete the perfectly-good segments. Better to fail now,
-                // schedule the delete, and let the user re-upload.
+                // the atomic flip to Processed failed (transient DB
+                // error?). Leaving the row in Processing means the
+                // safety net would mark it Failed in 24h and DeleteVideo
+                // would delete the otherwise-good segments. Cleaner to
+                // fail immediately, schedule the delete, and surface the
+                // error so the upload can be retried.
                 tracing::error!(
                     video_id = %video.id,
                     error = %e,

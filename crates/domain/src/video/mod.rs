@@ -76,14 +76,14 @@ impl VideoStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "PENDING_UPLOAD" => Self::PendingUpload,
-            "UPLOADED" => Self::Uploaded,
-            "PROCESSING" => Self::Processing,
-            "PROCESSED" => Self::Processed,
-            "FAILED" => Self::Failed,
-            _ => Self::Failed,
+            "PENDING_UPLOAD" => Some(Self::PendingUpload),
+            "UPLOADED" => Some(Self::Uploaded),
+            "PROCESSING" => Some(Self::Processing),
+            "PROCESSED" => Some(Self::Processed),
+            "FAILED" => Some(Self::Failed),
+            _ => None,
         }
     }
 }

@@ -62,7 +62,12 @@ async fn main() {
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(
-        S3StorageClient::new(s3_client, config.s3_bucket.clone(), config.cdn_base_url.clone()),
+        S3StorageClient::new(
+            s3_client,
+            config.s3_upload_bucket.clone(),
+            config.s3_output_bucket.clone(),
+            config.cdn_base_url.clone(),
+        ),
     );
 
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =

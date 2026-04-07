@@ -13,8 +13,8 @@ pub trait DistributedLockPort: Send + Sync {
         ttl_secs: u64,
     ) -> Result<Option<LockToken>, LockError>;
 
-    /// Release the lock. No-op if `token` does not match the current holder
-    /// (e.g. our TTL expired and another acquirer took the key).
+    /// Release the lock. No-op if `token` does not match the current
+    /// holder (e.g. the TTL expired and another acquirer took the key).
     async fn release(&self, key: &str, token: &LockToken) -> Result<(), LockError>;
 }
 

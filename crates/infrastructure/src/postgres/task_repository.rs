@@ -6,6 +6,26 @@ use domain::ports::error::RepositoryError;
 use domain::ports::task::TaskRepository;
 use domain::task::{Task, TaskId, TaskStatus, TaskUpdate};
 
+/// Selected columns for `tasks`. Listed once so the SELECTs and the row
+/// mapper can't drift.
+const TASK_COLUMNS: &str = "id, metadata_type, metadata, status, ordering_key, trace_id, \
+                            attempt_count, next_run_at, error, started_at, completed_at, \
+                            created_at, updated_at";
+
+/// Same as `TASK_COLUMNS` but every column prefixed with `t.` for use
+/// inside JOIN queries that alias the tasks table as `t`.
+const TASK_COLUMNS_T: &str = "t.id, t.metadata_type, t.metadata, t.status, t.ordering_key, \
+                              t.trace_id, t.attempt_count, t.next_run_at, t.error, \
+                              t.started_at, t.completed_at, t.created_at, t.updated_at";
+
+/// Stale-recovery threshold. Must match `STALE_RECOVERY_THRESHOLD` in
+/// `architecture/backend/task-system.md`. Tasks stuck IN_PROGRESS for
+/// longer than this are reset to PENDING by `reset_stale`.
+///
+/// Single source of truth here so changing the threshold doesn't require
+/// hunting through SQL strings.
+const STALE_RECOVERY_INTERVAL: &str = "1 hour";
+
 pub struct PostgresTaskRepository {
     pool: PgPool,
 }
@@ -16,13 +36,33 @@ impl PostgresTaskRepository {
     }
 }
 
+/// Map a `tasks` row into the domain entity. Panics on unknown
+/// `TaskStatus` values (corrupt DB / missing migration). Logs and
+/// substitutes `Value::Null` for unparseable JSON metadata so the handler
+/// can mark the task `PermanentFailure` instead of crashing the worker.
 fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
     let metadata_str: String = row.get("metadata");
+    let metadata = match serde_json::from_str(&metadata_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                metadata = %metadata_str,
+                "task row has corrupt metadata JSON; substituting Null",
+            );
+            serde_json::Value::Null
+        }
+    };
+
+    let status_str: &str = row.get("status");
+    let status = TaskStatus::from_str(status_str)
+        .unwrap_or_else(|| panic!("unknown TaskStatus in DB row: '{}'", status_str));
+
     Task {
         id: TaskId(row.get("id")),
         metadata_type: row.get("metadata_type"),
-        metadata: serde_json::from_str(&metadata_str).unwrap_or(serde_json::Value::Null),
-        status: TaskStatus::from_str(row.get("status")),
+        metadata,
+        status,
         ordering_key: row.get("ordering_key"),
         trace_id: row.get("trace_id"),
         attempt_count: row.get("attempt_count"),
@@ -38,7 +78,8 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
 #[async_trait]
 impl TaskRepository for PostgresTaskRepository {
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError> {
-        sqlx::query("SELECT * FROM tasks WHERE id = $1")
+        tracing::debug!(task_id = %id, "db: find task by id");
+        sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = $1"))
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
@@ -47,8 +88,9 @@ impl TaskRepository for PostgresTaskRepository {
     }
 
     async fn find_by_ids(&self, ids: &[TaskId]) -> Result<Vec<Task>, RepositoryError> {
+        tracing::debug!(count = ids.len(), "db: find tasks by ids");
         let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| id.0).collect();
-        sqlx::query("SELECT * FROM tasks WHERE id = ANY($1)")
+        sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ANY($1)"))
             .bind(&uuids)
             .fetch_all(&self.pool)
             .await
@@ -71,6 +113,7 @@ impl TaskRepository for PostgresTaskRepository {
         limit: i32,
         before: DateTime<Utc>,
     ) -> Result<Vec<Task>, RepositoryError> {
+        tracing::debug!(limit, "db: find pending tasks");
         // SQL structure:
         //   blocked_keys → ordering keys with an IN_PROGRESS task (cannot start another)
         //   eligible     → PENDING tasks not blocked by an in-progress sibling
@@ -81,7 +124,7 @@ impl TaskRepository for PostgresTaskRepository {
         //                  is cleaner than nested parens.
         //   selected     → keyed_dedup ∪ unkeyed eligible
         //   final SELECT → join back to tasks for the full row, order, and limit
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
             WITH blocked_keys AS (
                 SELECT DISTINCT ordering_key FROM tasks
@@ -111,13 +154,13 @@ impl TaskRepository for PostgresTaskRepository {
                 UNION ALL
                 SELECT id, next_run_at FROM eligible WHERE ordering_key IS NULL
             )
-            SELECT t.*
+            SELECT {TASK_COLUMNS_T}
             FROM tasks t
             JOIN selected s ON s.id = t.id
             ORDER BY s.next_run_at ASC, s.id ASC
             LIMIT $2
-            "#,
-        )
+            "#
+        ))
         .bind(before)
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -208,17 +251,17 @@ impl TaskRepository for PostgresTaskRepository {
     }
 
     /// Reset tasks stuck IN_PROGRESS for longer than the global stale
-    /// threshold (1 hour). This is a fixed value, not per-task: every task
-    /// type's `processing_timeout` MUST be less than the threshold so a
-    /// running handler is never reset by stale recovery. Today the limit
-    /// is 30 minutes per task type — see `TaskMetadata` docstring.
+    /// threshold. This is a fixed value, not per-task: every task type's
+    /// `processing_timeout` MUST be less than this threshold so a running
+    /// handler is never reset by stale recovery. Today the per-task limit
+    /// is 30 minutes — see `TaskMetadata` docstring.
     async fn reset_stale(&self) -> Result<i32, RepositoryError> {
-        let result = sqlx::query(
+        let result = sqlx::query(&format!(
             "UPDATE tasks SET status = 'PENDING', started_at = NULL, updated_at = NOW()
              WHERE status = 'IN_PROGRESS'
                AND started_at IS NOT NULL
-               AND started_at < NOW() - INTERVAL '1 hour'",
-        )
+               AND started_at < NOW() - INTERVAL '{STALE_RECOVERY_INTERVAL}'"
+        ))
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -230,6 +273,7 @@ impl TaskRepository for PostgresTaskRepository {
     }
 
     async fn count_active_by_type(&self, metadata_type: &str) -> Result<i64, RepositoryError> {
+        tracing::debug!(metadata_type, "db: count active tasks by type");
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM tasks WHERE metadata_type = $1 AND status IN ('PENDING', 'IN_PROGRESS')",
         )

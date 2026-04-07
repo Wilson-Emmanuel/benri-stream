@@ -66,7 +66,12 @@ async fn main() {
     let s3_client = aws_sdk_s3::Client::new(&aws_config);
 
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(
-        S3StorageClient::new(s3_client, config.s3_bucket.clone(), config.cdn_base_url.clone()),
+        S3StorageClient::new(
+            s3_client,
+            config.s3_upload_bucket.clone(),
+            config.s3_output_bucket.clone(),
+            config.cdn_base_url.clone(),
+        ),
     );
 
     // Redis
@@ -176,12 +181,12 @@ async fn main() {
     let (consumer_result, poller_result, recovery_result, checker_result) =
         tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
 
-    // Surface any panics. tokio::spawn catches panics into the JoinHandle
-    // so the runtime stays alive, but if we ignored these errors a
-    // panicked component would die silently and the worker would keep
+    // Surface any panics. tokio::spawn catches panics into the
+    // JoinHandle so the runtime stays alive, but ignoring these errors
+    // would let a panicked component die silently while the worker kept
     // running with one fewer component. Logging here makes the failure
-    // visible at process exit time at minimum; future work could add a
-    // supervisor that restarts the failed component during runtime.
+    // visible at process exit time at minimum; a follow-up could add a
+    // supervisor that restarts failed components at runtime.
     log_join_result("consumer", consumer_result);
     log_join_result("poller", poller_result);
     log_join_result("recovery", recovery_result);

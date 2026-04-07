@@ -318,13 +318,27 @@ so retries, ordering, and dedup are uniform across the system.
 - `FAILED` videos older than 24 hours → schedule `DeleteVideo`
 - `PROCESSED` videos are kept indefinitely
 
-The bulk-mark and bulk-schedule are two separate single-statement updates,
-not one transaction. This is intentional: the sweep is itself a safety net,
-and a partial failure between the two statements is recovered by the next
-sweep run (the now-FAILED videos are picked up via the FAILED-older-than-24h
-branch). Strict per-video atomicity would require expanding the transactional
-mutation API for negligible benefit, since the sweep is eventually consistent
-within one cycle.
+**Why 24 hours on FAILED**: the primary failure paths
+([UC-VID-002](#uc-vid-002) rejection,
+[UC-VID-005](#uc-vid-005) transcode failure) already schedule `DeleteVideo`
+immediately, in the same transaction as the `FAILED` transition. The sweep's
+FAILED branch is a safety net for the rare case where a video ended up
+`FAILED` without a `DeleteVideo` task (worker crashed between operations,
+manual DB intervention, future code path forgetting to schedule). The 24-hour
+window:
+- Gives the primary `DeleteVideo` task time to retry and complete, so the
+  sweep does not race it.
+- Prevents the sweep from creating redundant task rows on every run for
+  videos that already have an in-flight `DeleteVideo`.
+- Gives operators a window to inspect failed videos before they are
+  permanently removed.
+
+**Why bulk-mark and bulk-schedule are separate statements**: the sweep is
+itself a safety net, and a partial failure between the two statements is
+recovered by the next sweep run (the now-FAILED videos are picked up via the
+FAILED-older-than-24h branch). Strict per-video atomicity would require
+expanding the transactional mutation API for negligible benefit, since the
+sweep is eventually consistent within one cycle.
 
 Scheduling is dedup-by-default: re-running the sweep will not create duplicate
 `DeleteVideo` tasks for the same video while a previous task is still active

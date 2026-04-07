@@ -11,6 +11,11 @@ use super::quality::QualityLevel;
 /// longer = fewer files and better CDN cache efficiency. 4s is the balance.
 const SEGMENT_DURATION_SECS: u32 = 4;
 
+/// Presigned-GET TTL for the input file. Sized to comfortably outlast
+/// the task's `processing_timeout` (30 min for `ProcessVideoTaskMetadata`),
+/// since the task system cancels anything running longer than that.
+const INPUT_PRESIGN_TTL_SECS: u64 = 2 * 60 * 60;
+
 /// GStreamer-based transcoder. Reads from S3 via presigned URL, writes HLS
 /// segments to a local temp dir, uploads each to S3 as it completes, then
 /// deletes the local file.
@@ -24,10 +29,20 @@ impl GstreamerTranscoder {
         Self { storage }
     }
 
-    /// Generate a presigned URL for reading the input file from storage.
+    /// Generate a time-limited presigned GET URL for reading the input
+    /// file from storage. Presigned URLs (rather than the public CDN
+    /// URL) keep `uploads/` private — only a worker holding a fresh
+    /// presign can read the original file.
+    ///
+    /// `INPUT_PRESIGN_TTL_SECS` is sized to outlast probe (seconds) and
+    /// the longest realistic transcode for a 1 GB source.
     async fn input_url(&self, storage_key: &str) -> Result<String, TranscoderError> {
-        let url = self.storage.public_url(storage_key);
-        Ok(url)
+        self.storage
+            .generate_presigned_download_url(storage_key, INPUT_PRESIGN_TTL_SECS)
+            .await
+            .map_err(|e| {
+                TranscoderError::TranscodeFailed(format!("presign download url: {e}"))
+            })
     }
 
     /// Upload a local file to storage, then delete the local copy.
@@ -64,7 +79,7 @@ impl GstreamerTranscoder {
     /// streaming thread — that's how the encoders actually run in parallel.
     ///
     /// `has_audio` is determined upstream by `probe()` and threaded in,
-    /// so we don't have to re-read the file headers from S3.
+    /// avoiding a second header read from S3.
     fn run_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
@@ -77,10 +92,11 @@ impl GstreamerTranscoder {
 
         let pipeline = gst::Pipeline::new();
 
-        // Source: uridecodebin3 is the modern, streams-aware decode element.
-        // Stable since GStreamer 1.22; we're on 1.28. It has more accurate
-        // HTTP buffering than the older uridecodebin — relevant when reading
-        // from presigned S3 URLs where over-downloading costs real egress.
+        // Source: uridecodebin3 is the modern, streams-aware decode
+        // element, stable since GStreamer 1.22 (this build targets 1.28).
+        // It has more accurate HTTP buffering than the older
+        // uridecodebin — relevant when reading from presigned S3 URLs
+        // where over-downloading costs real egress.
         let src = gst::ElementFactory::make("uridecodebin3")
             .property("uri", input_url)
             .build()
@@ -223,11 +239,12 @@ impl GstreamerTranscoder {
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
 
-            // Pin H.264 profile=high, level=4.0 across all tiers. This lets
-            // us put a stable CODECS="avc1.640028,..." attribute in the
-            // master playlist so the player can pick a variant from the
+            // Pin H.264 profile=high, level=4.0 across all tiers. This
+            // allows a stable CODECS="avc1.640028,..." attribute in the
+            // master playlist, so the player can pick a variant from the
             // master alone instead of fetching every per-tier playlist
-            // first. High@4.0 fits all our outputs (max 1080p30, ≤25 Mbps).
+            // first. High@4.0 fits every output here (max 1080p30,
+            // ≤25 Mbps).
             let h264_caps = gst::ElementFactory::make("capsfilter")
                 .property(
                     "caps",
@@ -437,9 +454,9 @@ impl TranscoderPort for GstreamerTranscoder {
 
         let quality_levels = QualityLevel::all().to_vec();
 
-        // Run one GStreamer pipeline that decodes the input once and fans
-        // out to N encoder branches in parallel. GStreamer blocks on the
-        // bus, so we run the whole thing in spawn_blocking.
+        // Run one GStreamer pipeline that decodes the input once and
+        // fans out to N encoder branches in parallel. GStreamer blocks
+        // on the bus, so the whole pipeline runs inside spawn_blocking.
         {
             let url = input_url.clone();
             let dir = temp_path.clone();

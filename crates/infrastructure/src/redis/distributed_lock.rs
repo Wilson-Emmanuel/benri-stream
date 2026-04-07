@@ -63,12 +63,24 @@ impl DistributedLockPort for RedisDistributedLock {
             end
         "#;
 
-        let _: i64 = redis::Script::new(script)
+        let deleted: i64 = redis::Script::new(script)
             .key(key)
             .arg(&token.0)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| LockError::Internal(e.to_string()))?;
+
+        if deleted == 0 {
+            // The key was missing or the stored value did not match the
+            // supplied token. Either the TTL expired and Redis evicted
+            // the key, or another holder re-acquired it after expiry.
+            // Both indicate the TTL is too short relative to the work
+            // done while the lock was held.
+            tracing::warn!(
+                key,
+                "lock: release no-op — token mismatch (TTL likely expired)",
+            );
+        }
 
         Ok(())
     }

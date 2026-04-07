@@ -14,10 +14,9 @@ pub type TxFuture<'tx> = Pin<Box<dyn Future<Output = Result<(), RepositoryError>
 /// The closure receives a mutable reference to a [`TxScope`] bound to the
 /// transaction's lifetime and returns a future that runs inside it.
 ///
-/// The closure itself is `'static` — if you need to read data back out
-/// after the transaction commits, capture an owned handle like
-/// `Arc<AtomicBool>` or `Arc<Mutex<Option<T>>>` and write to it from
-/// inside the closure.
+/// The closure itself is `'static`. To read data back out after the
+/// transaction commits, capture an owned handle like `Arc<AtomicBool>`
+/// or `Arc<Mutex<Option<T>>>` and write to it from inside the closure.
 pub type TxClosure = Box<
     dyn for<'tx> FnOnce(&'tx mut (dyn TxScope + 'tx)) -> TxFuture<'tx> + Send + 'static,
 >;
@@ -26,9 +25,9 @@ pub type TxClosure = Box<
 /// Commits if the closure returns `Ok`, rolls back if it returns `Err` or
 /// panics.
 ///
-/// Use this when you need to bundle multiple writes into a single atomic
-/// unit — e.g. "update a row AND schedule a task." For single-statement
-/// writes, call the pool-backed repository methods directly (see
+/// Used for bundling multiple writes into a single atomic unit — e.g.
+/// "update a row AND schedule a task." Single-statement writes go
+/// directly through the pool-backed repository methods (see
 /// [`crate::ports::video::VideoRepository`] and
 /// [`crate::ports::task::TaskRepository`]).
 ///

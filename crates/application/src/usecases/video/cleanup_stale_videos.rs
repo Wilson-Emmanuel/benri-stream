@@ -91,7 +91,8 @@ impl CleanupStaleVideosUseCase {
                     None,
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Internal(e.to_string()))?;
 
         if !tasks.is_empty() {
             self.task_repo

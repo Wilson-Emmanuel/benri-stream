@@ -91,8 +91,8 @@ impl CompleteUploadUseCase {
         // rolls back and no stale task is left behind.
         //
         // `claimed` is an owned `Arc<AtomicBool>` so the closure can be
-        // `'static` while still letting us read the result after the tx
-        // commits.
+        // `'static` while still allowing the result to be read after the
+        // tx commits.
         let claimed = Arc::new(AtomicBool::new(false));
         let claimed_w = claimed.clone();
         let id_for_tx = video.id.clone();

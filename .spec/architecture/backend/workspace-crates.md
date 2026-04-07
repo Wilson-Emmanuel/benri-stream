@@ -132,10 +132,11 @@ All config is in `crates/infrastructure/src/config.rs`, read from environment va
 |--------|---------|---------|
 | Database URL | `DATABASE_URL` | `postgres://localhost:5432/benri_stream` |
 | Base URL | `BASE_URL` | `http://localhost:3000` |
-| S3 bucket | `S3_BUCKET` | `benri-stream` |
+| S3 upload bucket (private) | `S3_UPLOAD_BUCKET` | `benri-uploads` |
+| S3 output bucket (public-read) | `S3_OUTPUT_BUCKET` | `benri-stream` |
 | S3 region | `S3_REGION` | `us-east-1` |
 | S3 endpoint | `S3_ENDPOINT` | (none — uses AWS default) |
-| CDN base URL | `CDN_BASE_URL` | `http://localhost:9000/benri-stream` |
+| CDN base URL | `CDN_BASE_URL` | `http://localhost:8888` |
 | Redis URL | `REDIS_URL` | `redis://localhost:6379` |
 | Listen address | `LISTEN_ADDR` | `0.0.0.0:8080` |
 | OTel endpoint | `OTEL_ENDPOINT` | (none — traces in logs only) |

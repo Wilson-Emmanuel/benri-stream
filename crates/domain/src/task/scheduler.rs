@@ -30,16 +30,12 @@ impl TaskScheduler {
     pub fn build_pending_task<M: TaskMetadata>(
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
-    ) -> Task {
+    ) -> Result<Task, RepositoryError> {
         let now = Utc::now();
-        // `serde_json::to_value` only fails for `Serialize` impls that
-        // explicitly return an error — none of our `TaskMetadata` impls do.
-        // A failure here would be a programming bug in a metadata struct,
-        // not a runtime condition, so panic instead of returning an error.
         let metadata_json = serde_json::to_value(metadata)
-            .expect("TaskMetadata must serialize to a JSON value");
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        Task {
+        Ok(Task {
             id: TaskId::new(),
             metadata_type: metadata.metadata_type_name().to_string(),
             metadata: metadata_json,
@@ -53,7 +49,7 @@ impl TaskScheduler {
             completed_at: None,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 
     /// Schedule a task inside an open transaction. Use when the schedule
@@ -65,7 +61,7 @@ impl TaskScheduler {
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
     ) -> Result<Task, RepositoryError> {
-        let task = Self::build_pending_task(metadata, run_at);
+        let task = Self::build_pending_task(metadata, run_at)?;
         tasks.create(&task).await
     }
 
@@ -77,7 +73,7 @@ impl TaskScheduler {
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
     ) -> Result<Task, RepositoryError> {
-        let task = Self::build_pending_task(metadata, run_at);
+        let task = Self::build_pending_task(metadata, run_at)?;
         repo.create(&task).await
     }
 }

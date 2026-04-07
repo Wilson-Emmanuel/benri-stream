@@ -217,13 +217,13 @@ impl TaskStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "PENDING" => Self::Pending,
-            "IN_PROGRESS" => Self::InProgress,
-            "COMPLETED" => Self::Completed,
-            "DEAD_LETTER" => Self::DeadLetter,
-            _ => Self::Pending,
+            "PENDING" => Some(Self::Pending),
+            "IN_PROGRESS" => Some(Self::InProgress),
+            "COMPLETED" => Some(Self::Completed),
+            "DEAD_LETTER" => Some(Self::DeadLetter),
+            _ => None,
         }
     }
 }
