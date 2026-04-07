@@ -116,12 +116,22 @@ prevent long-running tasks from starving shorter ones.
 
 ### GStreamer Pipeline
 
-<!-- Replace with rendered diagram image -->
+One pipeline per transcode job. The input is decoded **once**, then a `tee` element
+fans the raw frames out to three encoder branches — one per quality level — each on
+its own thread (via the `queue` right after the tee).
 
-GStreamer reads input from S3 via presigned URL, decodes once, encodes at three quality
-levels in parallel, writes 4-second HLS segments to a temp directory. Each completed
+```
+uridecodebin → videoconvert → tee ─┬─ queue → videoscale → caps(360p)  → x264enc → h264parse → hlssink3(low)
+                                   ├─ queue → videoscale → caps(720p)  → x264enc → h264parse → hlssink3(med)
+                                   └─ queue → videoscale → caps(1080p) → x264enc → h264parse → hlssink3(high)
+```
+
+hlssink3 writes 4-second HLS segments to a local temp directory. Each completed
 segment is uploaded to S3 and the local file deleted. Workers are stateless — nothing
 persists between jobs.
+
+See [transcoding spec](.spec/architecture/backend/transcoding.md) for details on each
+element and the parallelism properties.
 
 ---
 

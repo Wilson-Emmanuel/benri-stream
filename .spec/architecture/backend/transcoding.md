@@ -18,19 +18,35 @@ uploaded to object storage as they complete, and deleted. Nothing persists betwe
 
 ## Pipeline Structure
 
-```
-Object Storage (input)
-    │
-    ▼
-  Source ──▶ Decode ──┬──▶ Encode (low, 360p)  ──▶ HLS Mux ──▶ Storage Sink (low/)
-                      ├──▶ Encode (medium, 720p) ──▶ HLS Mux ──▶ Storage Sink (medium/)
-                      └──▶ Encode (high, 1080p)  ──▶ HLS Mux ──▶ Storage Sink (high/)
+One GStreamer pipeline per transcode job. The input is decoded once, then a `tee`
+element fans the raw frames to N encoder branches — one per quality level — each
+scheduled on its own thread by the `queue` element right after the tee.
 
-                      + Master manifest → Storage Sink (master.m3u8)
+```
+uridecodebin → videoconvert → tee ─┬─ queue → videoscale → caps(360p)  → x264enc → h264parse → hlssink3(low)
+                                   ├─ queue → videoscale → caps(720p)  → x264enc → h264parse → hlssink3(med)
+                                   └─ queue → videoscale → caps(1080p) → x264enc → h264parse → hlssink3(high)
 ```
 
-All three quality levels are produced per segment simultaneously. The player gets
-adaptive bitrate from the first streamable segment.
+**Why each element**:
+- **`uridecodebin`** — reads from the presigned storage URL, auto-detects demuxer + decoder
+- **`videoconvert`** — normalizes the decoded frames to a common format before the tee, so all branches see consistent input
+- **`tee`** — fans the decoded stream to N branches. Src pads are requested dynamically (`src_%u`), one per level
+- **`queue`** (after each tee src pad) — critical for parallelism. GStreamer puts each side of a queue on its own streaming thread, so the three encoder branches actually run concurrently
+- **`videoscale` + `capsfilter`** — scales to the target resolution per branch
+- **`x264enc`** — H.264 encoder at the per-level target bitrate
+- **`h264parse`** — parses the encoded stream into frames hlssink3 can mux
+- **`hlssink3`** — writes .ts segments and per-level playlist.m3u8 to a local temp dir
+
+Segments are uploaded to object storage as the pipeline produces them, then the
+master `master.m3u8` is generated from the quality level metadata and uploaded.
+
+**Parallelism properties**:
+- **One decode, N encodes** — the input is read from storage and decoded exactly once
+- **Wall-time parallel** — encoders run on separate threads, so total time is bounded
+  by the slowest branch (high/1080p), not the sum
+- **Low quality finishes first** — naturally, because low resolution means less
+  encoding work per frame — which is what drives time-to-stream
 
 ---
 

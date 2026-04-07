@@ -45,95 +45,136 @@ impl GstreamerTranscoder {
         Ok(())
     }
 
-    /// Build and run the HLS transcoding pipeline for a single quality level.
-    /// Returns the number of segments produced.
-    fn run_pipeline_for_level(
+    /// Build and run a single HLS transcoding pipeline that decodes the input
+    /// once and fans out to one encoder branch per quality level via a `tee`:
+    ///
+    /// ```text
+    /// uridecodebin → videoconvert → tee ─┬─ queue → videoscale → caps(360p)  → x264enc → h264parse → hlssink3(low)
+    ///                                    ├─ queue → videoscale → caps(720p)  → x264enc → h264parse → hlssink3(med)
+    ///                                    └─ queue → videoscale → caps(1080p) → x264enc → h264parse → hlssink3(high)
+    /// ```
+    ///
+    /// One decode, N encoders running in parallel threads (the `queue` after
+    /// each tee src pad puts each branch on its own streaming thread).
+    ///
+    /// Returns the number of .ts segments produced per level, in the same
+    /// order as the input slice.
+    fn run_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
-        level: &QualityLevel,
-    ) -> Result<u32, TranscoderError> {
+        quality_levels: &[QualityLevel],
+    ) -> Result<Vec<u32>, TranscoderError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
 
         let pipeline = gst::Pipeline::new();
 
-        // Source: decode from URL
+        // Shared front-end: decode once, convert to a common format before
+        // the tee so all encoder branches see consistent pixel format.
         let src = gst::ElementFactory::make("uridecodebin")
             .property("uri", input_url)
             .build()
             .map_err(|e| TranscoderError::TranscodeFailed(format!("uridecodebin: {e}")))?;
-
-        // Video processing: scale + encode
-        let queue = gst::ElementFactory::make("queue").build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("queue: {e}")))?;
-        let convert = gst::ElementFactory::make("videoconvert").build()
+        let convert_main = gst::ElementFactory::make("videoconvert")
+            .build()
             .map_err(|e| TranscoderError::TranscodeFailed(format!("videoconvert: {e}")))?;
-        let scale = gst::ElementFactory::make("videoscale").build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("videoscale: {e}")))?;
-
-        let (width, height) = level.resolution();
-        let capsfilter = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst_video::VideoCapsBuilder::new()
-                    .width(width as i32)
-                    .height(height as i32)
-                    .build(),
-            )
+        let tee = gst::ElementFactory::make("tee")
             .build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
-
-        let bitrate_kbps = level.target_bitrate_bps() / 1000;
-        let enc = gst::ElementFactory::make("x264enc")
-            .property("bitrate", bitrate_kbps)
-            .property_from_str("tune", "zerolatency")
-            .property_from_str("speed-preset", "fast")
-            .property("key-int-max", (SEGMENT_DURATION_SECS * 30) as u32) // keyframe every segment
-            .build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
-
-        let h264parse = gst::ElementFactory::make("h264parse").build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
-
-        // HLS mux: writes segments to local temp dir
-        let level_dir = output_dir.join(level.name());
-        std::fs::create_dir_all(&level_dir)
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("mkdir: {e}")))?;
-
-        let playlist_path = level_dir.join("playlist.m3u8");
-        let segment_pattern = level_dir.join("segment_%05d.ts");
-
-        let hlssink = gst::ElementFactory::make("hlssink3")
-            .property("target-duration", SEGMENT_DURATION_SECS)
-            .property("playlist-length", 0u32) // VOD — keep all segments
-            .property("playlist-location", playlist_path.to_str().unwrap())
-            .property("location", segment_pattern.to_str().unwrap())
-            .build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink3: {e}")))?;
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("tee: {e}")))?;
 
         pipeline
-            .add_many([&src, &queue, &convert, &scale, &capsfilter, &enc, &h264parse, &hlssink])
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("add elements: {e}")))?;
+            .add_many([&src, &convert_main, &tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add front-end: {e}")))?;
+        gst::Element::link_many([&convert_main, &tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link convert→tee: {e}")))?;
 
-        gst::Element::link_many([&queue, &convert, &scale, &capsfilter, &enc, &h264parse, &hlssink])
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("link elements: {e}")))?;
-
-        // uridecodebin has dynamic pads — connect video pad when available
-        let queue_weak = queue.downgrade();
+        // uridecodebin has dynamic pads — link its video pad into videoconvert
+        // when decoding exposes it.
+        let convert_weak = convert_main.downgrade();
         src.connect_pad_added(move |_, pad| {
             let Some(caps) = pad.current_caps() else { return };
             let Some(s) = caps.structure(0) else { return };
             if !s.name().starts_with("video/") {
                 return;
             }
-            let Some(queue) = queue_weak.upgrade() else { return };
-            if let Some(sink_pad) = queue.static_pad("sink") {
+            let Some(convert) = convert_weak.upgrade() else { return };
+            if let Some(sink_pad) = convert.static_pad("sink") {
                 let _ = pad.link(&sink_pad);
             }
         });
 
-        // Run the pipeline
+        // Build one encoder branch per quality level. Each branch requests
+        // its own src pad from the tee.
+        for level in quality_levels {
+            let level_dir = output_dir.join(level.name());
+            std::fs::create_dir_all(&level_dir)
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("mkdir: {e}")))?;
+
+            // queue decouples this branch onto its own thread — this is what
+            // makes the encoders actually run in parallel.
+            let queue = gst::ElementFactory::make("queue")
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("queue: {e}")))?;
+            let scale = gst::ElementFactory::make("videoscale")
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("videoscale: {e}")))?;
+
+            let (width, height) = level.resolution();
+            let capsfilter = gst::ElementFactory::make("capsfilter")
+                .property(
+                    "caps",
+                    gst_video::VideoCapsBuilder::new()
+                        .width(width as i32)
+                        .height(height as i32)
+                        .build(),
+                )
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
+
+            let bitrate_kbps = level.target_bitrate_bps() / 1000;
+            let enc = gst::ElementFactory::make("x264enc")
+                .property("bitrate", bitrate_kbps)
+                .property_from_str("tune", "zerolatency")
+                .property_from_str("speed-preset", "fast")
+                .property("key-int-max", (SEGMENT_DURATION_SECS * 30) as u32)
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
+
+            let h264parse = gst::ElementFactory::make("h264parse")
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
+
+            let playlist_path = level_dir.join("playlist.m3u8");
+            let segment_pattern = level_dir.join("segment_%05d.ts");
+
+            let hlssink = gst::ElementFactory::make("hlssink3")
+                .property("target-duration", SEGMENT_DURATION_SECS)
+                .property("playlist-length", 0u32)
+                .property("playlist-location", playlist_path.to_str().unwrap())
+                .property("location", segment_pattern.to_str().unwrap())
+                .build()
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink3: {e}")))?;
+
+            pipeline
+                .add_many([&queue, &scale, &capsfilter, &enc, &h264parse, &hlssink])
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("add branch: {e}")))?;
+            gst::Element::link_many([&queue, &scale, &capsfilter, &enc, &h264parse, &hlssink])
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("link branch: {e}")))?;
+
+            // Link tee src pad to this branch's queue sink pad
+            let tee_src = tee
+                .request_pad_simple("src_%u")
+                .ok_or_else(|| TranscoderError::TranscodeFailed("tee request pad".into()))?;
+            let queue_sink = queue
+                .static_pad("sink")
+                .ok_or_else(|| TranscoderError::TranscodeFailed("queue sink pad".into()))?;
+            tee_src
+                .link(&queue_sink)
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("tee link: {e}")))?;
+        }
+
+        // Run the pipeline to completion
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| TranscoderError::TranscodeFailed(format!("set playing: {e}")))?;
@@ -145,11 +186,7 @@ impl GstreamerTranscoder {
             match msg.view() {
                 gst::MessageView::Eos(_) => break,
                 gst::MessageView::Error(err) => {
-                    error = Some(format!(
-                        "{} (debug: {:?})",
-                        err.error(),
-                        err.debug()
-                    ));
+                    error = Some(format!("{} (debug: {:?})", err.error(), err.debug()));
                     break;
                 }
                 _ => {}
@@ -162,22 +199,28 @@ impl GstreamerTranscoder {
             return Err(TranscoderError::TranscodeFailed(err_msg));
         }
 
-        // Count produced segments
-        let segment_count = std::fs::read_dir(&level_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext == "ts")
-                            .unwrap_or(false)
+        // Count produced .ts segments per level
+        let counts: Vec<u32> = quality_levels
+            .iter()
+            .map(|level| {
+                let level_dir = output_dir.join(level.name());
+                std::fs::read_dir(&level_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| {
+                                e.path()
+                                    .extension()
+                                    .map(|ext| ext == "ts")
+                                    .unwrap_or(false)
+                            })
+                            .count() as u32
                     })
-                    .count() as u32
+                    .unwrap_or(0)
             })
-            .unwrap_or(0);
+            .collect();
 
-        Ok(segment_count)
+        Ok(counts)
     }
 }
 
@@ -255,56 +298,59 @@ impl TranscoderPort for GstreamerTranscoder {
         let temp_path = temp_dir.path().to_path_buf();
 
         let quality_levels = QualityLevel::all().to_vec();
-        let mut total_segments: u32 = 0;
-        // Wrap the FnOnce callback in Option so we can `take()` it on first
-        // call. The compiler can't statically prove the loop body calls it
-        // at most once, so a bare FnOnce would be a use-after-move error.
-        let mut on_first_segment: Option<Box<dyn FnOnce() + Send>> = Some(on_first_segment);
 
-        // Process each quality level. The GStreamer pipeline runs synchronously
-        // (blocking on the bus), so we run each in spawn_blocking.
-        // All three levels decode from the same URL independently.
-        // This is parallel at the quality level — each level runs its own pipeline.
-        for level in &quality_levels {
+        // Run one GStreamer pipeline that decodes the input once and fans out
+        // to N encoder branches in parallel (see `run_parallel_pipeline`).
+        // GStreamer blocks on the bus, so we run the whole thing in
+        // spawn_blocking.
+        let segment_counts = {
             let url = input_url.clone();
             let dir = temp_path.clone();
-            let lvl = *level;
-
-            let segment_count = tokio::task::spawn_blocking(move || {
-                Self::run_pipeline_for_level(&url, &dir, &lvl)
+            let levels = quality_levels.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::run_parallel_pipeline(&url, &dir, &levels)
             })
             .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??;
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??
+        };
 
-            if segment_count > 0 {
-                // Upload all segments and playlist for this level
-                let level_dir = temp_path.join(level.name());
-                let mut entries: Vec<_> = std::fs::read_dir(&level_dir)
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("readdir: {e}")))?
-                    .filter_map(|e| e.ok())
-                    .collect();
-                entries.sort_by_key(|e| e.file_name());
+        // Upload the produced segments per level and fire `on_first_segment`
+        // once we've uploaded the first level that actually has segments.
+        // Wrap the FnOnce callback in Option so we can `take()` it — the
+        // compiler can't statically prove the loop body calls it at most once.
+        let mut on_first_segment: Option<Box<dyn FnOnce() + Send>> = Some(on_first_segment);
+        let mut total_segments: u32 = 0;
 
-                for entry in &entries {
-                    let path = entry.path();
-                    let filename = path.file_name().unwrap().to_str().unwrap();
-                    let s3_key = format!("{}{}/{}", output_prefix, level.name(), filename);
-                    let content_type = if filename.ends_with(".m3u8") {
-                        "application/vnd.apple.mpegurl"
-                    } else {
-                        "video/mp2t"
-                    };
+        for (level, count) in quality_levels.iter().zip(segment_counts.iter()) {
+            if *count == 0 {
+                continue;
+            }
 
-                    Self::upload_and_delete(storage.as_ref(), &path, &s3_key, content_type).await?;
-                }
+            let level_dir = temp_path.join(level.name());
+            let mut entries: Vec<_> = std::fs::read_dir(&level_dir)
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("readdir: {e}")))?
+                .filter_map(|e| e.ok())
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
 
-                total_segments += segment_count;
+            for entry in &entries {
+                let path = entry.path();
+                let filename = path.file_name().unwrap().to_str().unwrap();
+                let s3_key = format!("{}{}/{}", output_prefix, level.name(), filename);
+                let content_type = if filename.ends_with(".m3u8") {
+                    "application/vnd.apple.mpegurl"
+                } else {
+                    "video/mp2t"
+                };
 
-                // Notify on first successful segment. `take()` ensures the
-                // callback is called at most once across all iterations.
-                if let Some(cb) = on_first_segment.take() {
-                    cb();
-                }
+                Self::upload_and_delete(storage.as_ref(), &path, &s3_key, content_type).await?;
+            }
+
+            total_segments += count;
+
+            // Fire on the first level that produced segments.
+            if let Some(cb) = on_first_segment.take() {
+                cb();
             }
         }
 
