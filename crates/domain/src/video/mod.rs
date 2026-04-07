@@ -15,6 +15,12 @@ impl VideoId {
     }
 }
 
+impl Default for VideoId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for VideoId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -76,6 +82,10 @@ impl VideoStatus {
         }
     }
 
+    // Returns Option (not Result like std FromStr) because the only
+    // caller is the row mapper, which panics on None — there is no
+    // useful error value to wrap and propagate.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "PENDING_UPLOAD" => Some(Self::PendingUpload),
@@ -119,6 +129,10 @@ impl VideoFormat {
         }
     }
 
+    // Returns Option (not Result like std FromStr) for the same reason
+    // as VideoStatus::from_str above — caller wants a panic-on-None
+    // semantic, not an error value to propagate.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "MP4" => Some(Self::Mp4),

@@ -16,6 +16,12 @@ impl TaskId {
     }
 }
 
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for TaskId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -242,6 +248,10 @@ impl TaskStatus {
         }
     }
 
+    // Returns Option (not Result like std FromStr) because the only
+    // caller is the row mapper, which panics on None — there is no
+    // useful error value to wrap and propagate.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "PENDING" => Some(Self::Pending),

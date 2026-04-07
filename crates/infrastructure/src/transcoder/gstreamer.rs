@@ -235,7 +235,7 @@ impl GstreamerTranscoder {
                 .property("bitrate", bitrate_kbps)
                 .property_from_str("tune", "zerolatency")
                 .property_from_str("speed-preset", "fast")
-                .property("key-int-max", (SEGMENT_DURATION_SECS * 30) as u32)
+                .property("key-int-max", SEGMENT_DURATION_SECS * 30)
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
 
@@ -382,7 +382,7 @@ impl TranscoderPort for GstreamerTranscoder {
         let url = self.input_url(storage_key).await?;
 
         // Discoverer runs synchronously — use spawn_blocking to avoid blocking tokio
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             gst::init().map_err(|e| TranscoderError::ProbeFailed(format!("gst init: {e}")))?;
 
             let discoverer = gst_pbutils::Discoverer::new(gst::ClockTime::from_seconds(30))
@@ -420,9 +420,7 @@ impl TranscoderPort for GstreamerTranscoder {
             })
         })
         .await
-        .map_err(|e| TranscoderError::ProbeFailed(format!("task join: {e}")))?;
-
-        result
+        .map_err(|e| TranscoderError::ProbeFailed(format!("task join: {e}")))?
     }
 
     async fn transcode_to_hls(
