@@ -56,23 +56,12 @@ impl CompleteUploadUseCase {
             .ok_or(Error::FileNotFoundInStorage)?;
 
         if metadata.size_bytes > MAX_UPLOAD_SIZE_BYTES {
-            // Schedule immediate deletion. Single-statement task insert,
-            // no transaction needed. If the schedule itself fails, the
-            // safety-net sweep (UC-VID-006) picks it up within 24h — log
-            // and still return the user error.
-            if let Err(e) = TaskScheduler::schedule_standalone(
+            schedule_delete_after_rejection(
                 self.task_repo.as_ref(),
-                &DeleteVideoTaskMetadata { video_id: video.id.clone() },
-                None,
+                &video.id,
+                "FileTooLarge",
             )
-            .await
-            {
-                tracing::warn!(
-                    video_id = %video.id,
-                    error = %e,
-                    "failed to schedule DeleteVideo after FileTooLarge rejection; safety-net sweep will collect",
-                );
-            }
+            .await;
             return Err(Error::FileTooLarge);
         }
 
@@ -86,19 +75,12 @@ impl CompleteUploadUseCase {
             })?;
 
         if !video.format.validate_signature(&header_bytes) {
-            if let Err(e) = TaskScheduler::schedule_standalone(
+            schedule_delete_after_rejection(
                 self.task_repo.as_ref(),
-                &DeleteVideoTaskMetadata { video_id: video.id.clone() },
-                None,
+                &video.id,
+                "InvalidFileSignature",
             )
-            .await
-            {
-                tracing::warn!(
-                    video_id = %video.id,
-                    error = %e,
-                    "failed to schedule DeleteVideo after InvalidFileSignature rejection; safety-net sweep will collect",
-                );
-            }
+            .await;
             return Err(Error::InvalidFileSignature);
         }
 
@@ -149,6 +131,31 @@ impl CompleteUploadUseCase {
             id: video.id,
             status: VideoStatus::Uploaded,
         })
+    }
+}
+
+/// Schedule a `DeleteVideo` task standalone (no transaction, no business
+/// mutation to bundle with — the rejected video stays in `PENDING_UPLOAD`
+/// and the task cleans it up). If the schedule itself fails, log it and
+/// let the safety-net sweep (UC-VID-006) collect the orphaned video later.
+async fn schedule_delete_after_rejection(
+    task_repo: &dyn TaskRepository,
+    video_id: &VideoId,
+    rejection: &'static str,
+) {
+    if let Err(e) = TaskScheduler::schedule_standalone(
+        task_repo,
+        &DeleteVideoTaskMetadata { video_id: video_id.clone() },
+        None,
+    )
+    .await
+    {
+        tracing::warn!(
+            video_id = %video_id,
+            rejection,
+            error = %e,
+            "failed to schedule DeleteVideo after rejection; safety-net sweep will collect",
+        );
     }
 }
 

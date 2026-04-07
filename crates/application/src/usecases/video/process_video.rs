@@ -91,18 +91,26 @@ impl ProcessVideoUseCase {
             }
             Ok(false) => {
                 // Status was no longer Processing — recovered out from
-                // under us by something else. Nothing to do.
+                // under us by something else (e.g. safety-net sweep).
+                // The other path owns the row's lifecycle, nothing to do.
                 tracing::warn!(
                     video_id = %video.id,
                     "mark_processed found no row in Processing state",
                 );
             }
             Err(e) => {
+                // The transcode succeeded and segments are uploaded, but
+                // we couldn't flip the status to Processed (transient DB
+                // error?). If we leave the row in Processing, the safety
+                // net would mark it Failed in 24h and DeleteVideo would
+                // delete the perfectly-good segments. Better to fail now,
+                // schedule the delete, and let the user re-upload.
                 tracing::error!(
                     video_id = %video.id,
                     error = %e,
-                    "failed to mark video processed; safety-net sweep will collect",
+                    "failed to mark video processed after successful transcode; failing the video",
                 );
+                self.fail(&video.id, "mark_processed failed").await;
             }
         }
 
@@ -135,12 +143,8 @@ async fn fail_and_schedule_delete(
                 .videos()
                 .update_status_if(&id, VideoStatus::Processing, VideoStatus::Failed)
                 .await?;
-            TaskScheduler::schedule_in_tx(
-                scope.tasks(),
-                &DeleteVideoTaskMetadata { video_id: id.clone() },
-                None,
-            )
-            .await?;
+            let metadata = DeleteVideoTaskMetadata { video_id: id };
+            TaskScheduler::schedule_in_tx(scope.tasks(), &metadata, None).await?;
             Ok(())
         })
     }))

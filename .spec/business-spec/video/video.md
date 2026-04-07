@@ -144,16 +144,21 @@ signature (magic bytes), and checks actual size from storage metadata.
 | `FILE_NOT_FOUND_IN_STORAGE` | File not at expected key |
 | `FILE_TOO_LARGE` | Actual size exceeds 1 GB |
 | `INVALID_FILE_SIGNATURE` | First bytes don't match declared format |
-| `ALPROCESSED_COMPLETED` | Video is past PENDING_UPLOAD |
+| `ALREADY_COMPLETED` | Video is past PENDING_UPLOAD |
 
 **Side Effects**
 
 - On `FILE_TOO_LARGE` or `INVALID_FILE_SIGNATURE`: schedule a `DeleteVideo` task
-  ([UC-VID-007](#uc-vid-007)) to immediately remove the rejected upload and its
-  video record. The task is scheduled in the same DB transaction as the rejection.
-  No side effect on the success path — the worker picks up `UPLOADED` videos independently.
+  ([UC-VID-007](#uc-vid-007)) to remove the rejected upload and its video record.
+  The schedule is standalone (no enclosing transaction) — there is no business
+  mutation in the rejection path to bundle with, since the video stays in
+  `PENDING_UPLOAD`. If the schedule itself fails, the safety-net sweep
+  ([UC-VID-006](#uc-vid-006)) collects the orphaned video on its next run.
+- On the success path: schedule a `ProcessVideo` task in the same DB transaction
+  as the `PENDING_UPLOAD → UPLOADED` status update — the task must exist if and
+  only if the status update commits.
 
-**Idempotency**: Not idempotent — calling again after completion returns `ALPROCESSED_COMPLETED`.
+**Idempotency**: Not idempotent — calling again after completion returns `ALREADY_COMPLETED`.
 
 ---
 
@@ -309,9 +314,17 @@ so retries, ordering, and dedup are uniform across the system.
 **Mutations**
 - `PENDING_UPLOAD` older than 24 hours → schedule `DeleteVideo`
 - `UPLOADED` or `PROCESSING` older than 24 hours with no progress →
-  atomically set `status = FAILED` and schedule `DeleteVideo` (same transaction)
+  bulk-mark `status = FAILED`, then bulk-schedule `DeleteVideo` for the same set
 - `FAILED` videos older than 24 hours → schedule `DeleteVideo`
 - `PROCESSED` videos are kept indefinitely
+
+The bulk-mark and bulk-schedule are two separate single-statement updates,
+not one transaction. This is intentional: the sweep is itself a safety net,
+and a partial failure between the two statements is recovered by the next
+sweep run (the now-FAILED videos are picked up via the FAILED-older-than-24h
+branch). Strict per-video atomicity would require expanding the transactional
+mutation API for negligible benefit, since the sweep is eventually consistent
+within one cycle.
 
 Scheduling is dedup-by-default: re-running the sweep will not create duplicate
 `DeleteVideo` tasks for the same video while a previous task is still active

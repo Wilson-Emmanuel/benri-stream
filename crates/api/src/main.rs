@@ -78,7 +78,10 @@ async fn main() {
             video_repo.clone(), task_repo, tx_port, storage.clone(),
         )),
         get_video_status: Arc::new(GetVideoStatusUseCase::new(video_repo.clone(), config.base_url.clone())),
-        get_video_by_token: Arc::new(GetVideoByTokenUseCase::new(video_repo.clone(), storage.clone())),
+        get_video_by_token: Arc::new(GetVideoByTokenUseCase::new(
+            video_repo.clone(),
+            config.cdn_base_url.clone(),
+        )),
     };
 
     let app = Router::new()

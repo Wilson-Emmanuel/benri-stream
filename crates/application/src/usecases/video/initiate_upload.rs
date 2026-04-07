@@ -18,17 +18,21 @@ impl InitiateUploadUseCase {
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
+        let title = input.title.trim().to_string();
+        let title_chars = title.chars().count();
+
         tracing::info!(
             mime_type = %input.mime_type,
-            title_len = input.title.len(),
+            title_chars,
             "initiating upload",
         );
 
-        let title = input.title.trim().to_string();
         if title.is_empty() {
             return Err(Error::TitleRequired);
         }
-        if title.len() > MAX_TITLE_LENGTH {
+        // Spec says "1–100 chars", not bytes. `String::len` returns bytes,
+        // so a 100-emoji title would be ~400 bytes and wrongly rejected.
+        if title_chars > MAX_TITLE_LENGTH {
             return Err(Error::TitleTooLong);
         }
 

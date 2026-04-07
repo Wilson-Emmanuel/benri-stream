@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
-use domain::ports::storage::StoragePort;
 use domain::ports::video::VideoRepository;
 
 pub struct GetVideoByTokenUseCase {
     video_repo: Arc<dyn VideoRepository>,
-    storage: Arc<dyn StoragePort>,
+    cdn_base_url: String,
 }
 
 impl GetVideoByTokenUseCase {
-    pub fn new(video_repo: Arc<dyn VideoRepository>, storage: Arc<dyn StoragePort>) -> Self {
-        Self { video_repo, storage }
+    pub fn new(video_repo: Arc<dyn VideoRepository>, cdn_base_url: String) -> Self {
+        Self { video_repo, cdn_base_url }
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
@@ -21,9 +20,7 @@ impl GetVideoByTokenUseCase {
             .map_err(|e| Error::Internal(e.to_string()))?
             .ok_or(Error::VideoNotFound)?;
 
-        let stream_url = video.stream_url(
-            &self.storage.public_url("").trim_end_matches('/').to_string()
-        );
+        let stream_url = video.stream_url(self.cdn_base_url.trim_end_matches('/'));
 
         Ok(Output {
             title: video.title,
