@@ -163,23 +163,65 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
+    /// Apply N updates as a single atomic SQL statement.
+    ///
+    /// Uses `UPDATE ... FROM UNNEST(...)` so the whole batch is one trip
+    /// to Postgres. Because it's a single statement, Postgres autocommits
+    /// it atomically — no enclosing transaction needed.
+    ///
+    /// `next_run_at` is COALESCEd against the existing row value: a `None`
+    /// in `TaskUpdate.next_run_at` means "leave the column alone" rather
+    /// than "set it to NULL" (the column is `NOT NULL`). This matters for
+    /// terminal outcomes (`Completed`, `DeadLetter`) where `compute_update`
+    /// returns `next_run_at: None` because no future run is expected.
     async fn batch_update(&self, updates: &[TaskUpdate]) -> Result<(), RepositoryError> {
-        for update in updates {
-            sqlx::query(
-                "UPDATE tasks SET status = $2, attempt_count = $3, next_run_at = $4,
-                 error = $5, completed_at = $6, updated_at = $7 WHERE id = $1",
-            )
-            .bind(update.task_id.0)
-            .bind(update.status.as_str())
-            .bind(update.attempt_count)
-            .bind(update.next_run_at)
-            .bind(&update.error)
-            .bind(update.completed_at)
-            .bind(update.updated_at)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if updates.is_empty() {
+            return Ok(());
         }
+
+        let ids: Vec<uuid::Uuid> = updates.iter().map(|u| u.task_id.0).collect();
+        let statuses: Vec<String> =
+            updates.iter().map(|u| u.status.as_str().to_string()).collect();
+        let attempt_counts: Vec<i32> = updates.iter().map(|u| u.attempt_count).collect();
+        let next_run_ats: Vec<Option<DateTime<Utc>>> =
+            updates.iter().map(|u| u.next_run_at).collect();
+        let errors: Vec<Option<String>> = updates.iter().map(|u| u.error.clone()).collect();
+        let completed_ats: Vec<Option<DateTime<Utc>>> =
+            updates.iter().map(|u| u.completed_at).collect();
+        let updated_ats: Vec<DateTime<Utc>> = updates.iter().map(|u| u.updated_at).collect();
+
+        sqlx::query(
+            r#"
+            UPDATE tasks t
+            SET status = v.status,
+                attempt_count = v.attempt_count,
+                next_run_at = COALESCE(v.next_run_at, t.next_run_at),
+                error = v.error,
+                completed_at = v.completed_at,
+                updated_at = v.updated_at
+            FROM UNNEST(
+                $1::uuid[],
+                $2::varchar[],
+                $3::int4[],
+                $4::timestamptz[],
+                $5::text[],
+                $6::timestamptz[],
+                $7::timestamptz[]
+            ) AS v(id, status, attempt_count, next_run_at, error, completed_at, updated_at)
+            WHERE t.id = v.id
+            "#,
+        )
+        .bind(&ids)
+        .bind(&statuses)
+        .bind(&attempt_counts)
+        .bind(&next_run_ats)
+        .bind(&errors)
+        .bind(&completed_ats)
+        .bind(&updated_ats)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         Ok(())
     }
 
