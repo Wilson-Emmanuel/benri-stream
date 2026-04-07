@@ -63,32 +63,20 @@ impl GstreamerTranscoder {
     /// The `queue` element after each tee src pad puts the branch on its own
     /// streaming thread — that's how the encoders actually run in parallel.
     ///
+    /// `has_audio` is determined upstream by `probe()` and threaded in,
+    /// so we don't have to re-read the file headers from S3.
+    ///
     /// Returns the number of .ts segments produced per level, in the same
     /// order as the input slice.
     fn run_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
         quality_levels: &[QualityLevel],
+        has_audio: bool,
     ) -> Result<Vec<u32>, TranscoderError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
-        use gstreamer_pbutils as gst_pbutils;
         use gstreamer_video as gst_video;
-
-        // Quick pre-check: does the source have an audio stream? We only
-        // build the audio branch if so. The Discoverer reads headers only,
-        // so it's cheap compared to the transcode itself. The ProcessVideo
-        // use case already ran `probe()` first, but the ProbeResult type
-        // doesn't currently expose stream-level detail — running the
-        // discoverer again is a few hundred ms and avoids a port change.
-        let has_audio = {
-            let d = gst_pbutils::Discoverer::new(gst::ClockTime::from_seconds(30))
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("discoverer: {e}")))?;
-            let info = d
-                .discover_uri(input_url)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("discover: {e}")))?;
-            !info.audio_streams().is_empty()
-        };
 
         let pipeline = gst::Pipeline::new();
 
@@ -412,11 +400,14 @@ impl TranscoderPort for GstreamerTranscoder {
                 .and_then(|c| c.structure(0).map(|s| s.name().to_string()))
                 .unwrap_or_else(|| "unknown".into());
 
+            let has_audio = !info.audio_streams().is_empty();
+
             Ok(ProbeResult {
                 duration_seconds,
                 width,
                 height,
                 codec,
+                has_audio,
             })
         })
         .await
@@ -429,17 +420,24 @@ impl TranscoderPort for GstreamerTranscoder {
         &self,
         input_key: &str,
         output_prefix: &str,
+        probe: &ProbeResult,
         on_first_segment: Box<dyn FnOnce() + Send>,
     ) -> Result<TranscodeResult, TranscoderError> {
         use gstreamer as gst;
 
-        tracing::info!(input_key, output_prefix, "transcoder: starting HLS transcode");
+        tracing::info!(
+            input_key,
+            output_prefix,
+            has_audio = probe.has_audio,
+            "transcoder: starting HLS transcode",
+        );
 
         gst::init().map_err(|e| TranscoderError::TranscodeFailed(format!("gst init: {e}")))?;
 
         let input_url = self.input_url(input_key).await?;
         let storage = self.storage.clone();
         let output_prefix = output_prefix.to_string();
+        let has_audio = probe.has_audio;
 
         // Create temp directory for this job
         let temp_dir = tempfile::tempdir()
@@ -457,7 +455,7 @@ impl TranscoderPort for GstreamerTranscoder {
             let dir = temp_path.clone();
             let levels = quality_levels.clone();
             tokio::task::spawn_blocking(move || {
-                Self::run_parallel_pipeline(&url, &dir, &levels)
+                Self::run_parallel_pipeline(&url, &dir, &levels, has_audio)
             })
             .await
             .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??

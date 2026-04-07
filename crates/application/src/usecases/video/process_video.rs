@@ -46,18 +46,22 @@ impl ProcessVideoUseCase {
             return Ok(()); // Another worker claimed it
         }
 
-        // Probe
-        if let Err(e) = self.transcoder.probe(&video.upload_key).await {
-            tracing::error!(video_id = %video.id, error = %e, "probe failed");
-            if let Err(tx_err) = fail_and_schedule_delete(&self.tx, &video.id).await {
-                tracing::error!(
-                    video_id = %video.id,
-                    error = %tx_err,
-                    "failed to record probe-failure outcome; safety-net sweep will collect",
-                );
+        // Probe — also captures has_audio so transcode_to_hls doesn't have
+        // to re-read the file headers.
+        let probe = match self.transcoder.probe(&video.upload_key).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(video_id = %video.id, error = %e, "probe failed");
+                if let Err(tx_err) = fail_and_schedule_delete(&self.tx, &video.id).await {
+                    tracing::error!(
+                        video_id = %video.id,
+                        error = %tx_err,
+                        "failed to record probe-failure outcome; safety-net sweep will collect",
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
+        };
 
         // Transcode — the on_first_segment callback signals via a oneshot
         // channel. A sibling task awaits the signal and does the share-token
@@ -101,7 +105,7 @@ impl ProcessVideoUseCase {
         let output_prefix = video.storage_prefix();
         let transcode_result = self
             .transcoder
-            .transcode_to_hls(&video.upload_key, &output_prefix, on_first_segment)
+            .transcode_to_hls(&video.upload_key, &output_prefix, &probe, on_first_segment)
             .await;
 
         // Wait for the signal writer to drain before any post-transcode
