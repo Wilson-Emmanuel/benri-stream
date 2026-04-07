@@ -64,13 +64,6 @@ pub struct Task {
     pub error: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
-
-    // Denormalized scheduling config — see below.
-    pub max_retries: Option<i32>,
-    pub retry_base_delay_ms: i64,
-    pub execution_interval_ms: Option<i64>,
-    pub processing_timeout_ms: i64,
-
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -78,16 +71,21 @@ pub struct Task {
 pub enum TaskStatus { Pending, InProgress, Completed, DeadLetter }
 ```
 
-**Why scheduling config is denormalized onto the row**: the `metadata` payload
-is stored as `serde_json::Value`, which loses the concrete `TaskMetadata` type.
-If the consumer had to call `metadata.max_retries()` at runtime to decide
-whether to dead-letter, it would need a type registry to deserialize the Value
-back into a typed metadata — extra moving parts and risk of drift. Instead,
-`TaskScheduler::schedule` reads the scheduling config from the trait at
-schedule time and writes it into the four dedicated columns. The consumer and
-`Task::compute_update` read the config directly from the row, and changes to
-the trait defaults only affect newly-scheduled tasks (values at the time of
-schedule are latched).
+**Scheduling config is NOT stored on the row.** `max_retries`,
+`retry_base_delay`, `execution_interval`, and `processing_timeout` live on
+the typed `TaskMetadata` impl and are read at run time. The
+`HandlerAdapter` deserializes the metadata from `task.metadata: Value`
+into the concrete type before computing the update, then passes the typed
+metadata to `Task::compute_update<M: TaskMetadata>`.
+
+This design has two consequences:
+
+- **Config changes are immediate.** Bumping `max_retries` from 5 to 10 in
+  the metadata trait impl applies to existing tasks on their next run.
+  No migration needed.
+- **Rolling deploys may briefly run on different config.** During a rolling
+  upgrade, two workers with different code versions may use different
+  values for the same task. Acceptable at our scale.
 
 ### TaskMetadata trait
 
@@ -98,7 +96,10 @@ trait impl cannot drift.
 
 ```rust
 pub trait TaskMetadata: Send + Sync + Serialize + DeserializeOwned {
-    /// Max time before the worker cancels processing.
+    /// Max time before the worker cancels processing. MUST stay below
+    /// 30 minutes (the global stale-recovery threshold is 1 hour, so a
+    /// 30-minute task plus retry delay still fits inside the safety
+    /// window). See "Stale Recovery" below.
     fn processing_timeout(&self) -> Duration { Duration::from_secs(300) }
 
     /// If set, the task is recurring — rescheduled after each completion.
@@ -110,8 +111,14 @@ pub trait TaskMetadata: Send + Sync + Serialize + DeserializeOwned {
     /// Base delay for exponential backoff. Actual = base * 2^attempt_count, capped at 30min.
     fn retry_base_delay(&self) -> Duration { Duration::from_secs(30) }
 
-    /// Tasks with the same ordering key are processed sequentially and
-    /// dedup-by-default on schedule.
+    /// Tasks with the same ordering key are processed sequentially —
+    /// at most one active at a time per (metadata_type, ordering_key),
+    /// enforced by `find_pending`'s CTE which filters out keys with an
+    /// IN_PROGRESS sibling. Used for resource serialization (e.g.
+    /// "only one task at a time can mutate this video"), NOT for
+    /// deduplication. Multiple `schedule()` calls for the same logical
+    /// task are allowed and create multiple rows. Handlers MUST be
+    /// idempotent (see "Handler Idempotency" below).
     fn ordering_key(&self) -> Option<String> { None }
 
     /// System tasks are recurring and auto-recreated if missing.
@@ -163,33 +170,36 @@ pub enum TaskResult {
 }
 ```
 
+**Skip / Terminate reason storage**: when computing the TaskUpdate, the
+`reason` from `Skip` is stored in the `error` column prefixed with
+`"Skipped: "`, and `Terminate` is prefixed with `"Terminated: "`. The
+`error` column doubles as a "last message" channel since the schema has
+no dedicated last-message column. Any query for actual failures should
+filter out rows whose error starts with `"Skipped: "` / `"Terminated: "`.
+
 ### Ports
 
 ```rust
 // In crates/domain/src/task/ports.rs
 
-/// Worker-internal task lifecycle operations. Task creation from use cases
-/// goes through TaskScheduler + TaskMutations inside a TxScope.
+/// Worker-internal task lifecycle operations + bulk creation. Single-task
+/// creation from use cases goes through TaskScheduler + TaskMutations
+/// inside a TxScope. Bulk creation is pool-backed since one INSERT
+/// statement is atomic and has nothing to bundle with.
 pub trait TaskRepository: Send + Sync {
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError>;
     async fn find_by_ids(&self, ids: &[TaskId]) -> Result<Vec<Task>, RepositoryError>;
     async fn find_pending(&self, limit: i32, before: DateTime<Utc>) -> Result<Vec<Task>, RepositoryError>;
     async fn mark_in_progress(&self, ids: &[TaskId], started_at: DateTime<Utc>) -> Result<(), RepositoryError>;
     async fn batch_update(&self, updates: &[TaskUpdate]) -> Result<(), RepositoryError>;
-    async fn reset_stale(&self, threshold: DateTime<Utc>) -> Result<i32, RepositoryError>;
+    async fn reset_stale(&self) -> Result<i32, RepositoryError>;
     async fn count_active_by_type(&self, metadata_type: &str) -> Result<i64, RepositoryError>;
+    async fn bulk_create(&self, tasks: &[Task]) -> Result<(), RepositoryError>;
 }
 
-/// Task operations performed inside a TxScope (see ports/unit_of_work.rs).
-/// Task creation and the dedup-lookup both live here so they can share
-/// a transaction with the triggering business mutation.
+/// Single-task creation inside a TxScope (see ports/unit_of_work.rs).
 pub trait TaskMutations: Send {
     async fn create(&mut self, task: &Task) -> Result<Task, RepositoryError>;
-    async fn find_active_by_ordering_key(
-        &mut self,
-        metadata_type: &str,
-        ordering_key: &str,
-    ) -> Result<Option<Task>, RepositoryError>;
 }
 
 pub trait TaskPublisher: Send + Sync {
@@ -216,38 +226,38 @@ impl TaskScheduler {
     pub async fn schedule<M: TaskMetadata>(
         tasks: &mut dyn TaskMutations,
         metadata: &M,
-        trace_id: Option<String>,
         run_at: Option<DateTime<Utc>>,
     ) -> Result<Task, RepositoryError> {
-        // 1. If metadata has an ordering_key, check for an active
-        //    (PENDING or IN_PROGRESS) task with the same
-        //    (metadata_type, ordering_key) — return it if found (dedup).
-        // 2. Otherwise, read scheduling config from the metadata trait
-        //    and persist it into the new Task row.
+        // Construct a Task with PENDING status and insert via tasks.create.
+        // No deduplication — handlers must be idempotent.
     }
 }
 ```
 
-**Ordering-key dedup**: when the metadata declares an `ordering_key`, `schedule()`
-is **dedup-by-default** within `(metadata_type, ordering_key)`. If an active
-(`PENDING` or `IN_PROGRESS`) task already exists for the same pair, `schedule()`
-returns that existing task instead of creating a duplicate. This is enforced via
-`TaskMutations::find_active_by_ordering_key`. Callers do not need to check
-themselves — repeated `schedule()` calls for the same key are safe and idempotent.
-A partial unique index on `tasks(metadata_type, ordering_key) WHERE status IN
-('PENDING','IN_PROGRESS')` backs up the in-tx check against races.
+**No deduplication.** Repeated `schedule()` calls for the same logical
+task create multiple rows. The system relies on **handler idempotency**
+and `ordering_key`-based sequential processing to handle duplicates safely:
+the second runner sees the work already done (by the first) and returns
+`Skip` or a no-op `Success`. See "Handler Idempotency" below.
 
-This means `ordering_key` carries two meanings:
-1. **Sequential processing** — tasks with the same key never run concurrently
-   (enforced by `find_pending` via a CTE with `DISTINCT ON (ordering_key)` and
-   a blocked-keys filter against IN_PROGRESS siblings).
-2. **Active uniqueness** — at most one active task per `(metadata_type, key)`.
+Why no dedup? Two reasons:
+1. **Conceptual clarity.** `ordering_key` is for resource serialization
+   ("only one task at a time can mutate this resource"), not for "is this
+   task already scheduled". The catalog and handler code are simpler when
+   the two concerns are not conflated.
+2. **No racy code paths.** A dedup check requires a read inside the tx
+   plus a backstop unique index. The check has known race windows that
+   convert into unique-violation errors at the index. Since handlers are
+   idempotent anyway, the dedup check adds complexity for no safety
+   benefit.
 
-Callers that need ordering without dedup, or dedup without sequential processing,
-should not be added without revisiting this design.
+**`run_at`**: pass `Some(future_timestamp)` to defer the task's first
+eligibility. Defaults to `now`.
 
-**`run_at`**: pass `Some(future_timestamp)` to defer the task's first eligibility.
-Defaults to `now`.
+**`trace_id`**: not currently propagated. Tasks are created with
+`trace_id: None`. When OpenTelemetry / a tracing-context port is wired,
+populate it from the current span inside `TaskScheduler::schedule`. The
+column exists on the row and the consumer reads it for span propagation.
 
 ---
 
@@ -354,8 +364,27 @@ Lock ensures only one instance polls at a time. Observes shutdown signal.
 
 ### Stale Recovery
 
-Runs periodically. Acquires distributed lock → finds IN_PROGRESS tasks older
-than a threshold → resets to PENDING. Observes shutdown signal.
+Runs periodically. Acquires distributed lock → finds IN_PROGRESS tasks
+whose `started_at` is older than the **global stale threshold** → resets
+to PENDING. Observes shutdown signal.
+
+The threshold is a **fixed 1 hour**, enforced inside
+`TaskRepository::reset_stale`. The reasoning:
+
+- The threshold must exceed every task type's `processing_timeout`,
+  otherwise stale recovery would reset a still-running handler and
+  another worker would pick the task up — double processing.
+- Per-task thresholds (computed from `started_at + processing_timeout`)
+  would work but require persisting `processing_timeout` on the row,
+  which conflicts with our "config lives in metadata trait" model.
+- Picking a single value larger than any task's timeout is simple and
+  documented.
+
+**Hard limit on `processing_timeout`**: 30 minutes per task type. The
+limit gives a 30-minute safety buffer below the 1-hour threshold to
+absorb retry delays, scheduling jitter, and clock skew. New task types
+with longer-running handlers would require revisiting the threshold
+(and updating this doc + the trait docstring + the worker constant).
 
 ### System Task Checker
 
@@ -372,10 +401,15 @@ or if a bug caused the rescheduling to be lost.
 
 ### Distributed Lock
 
-`DistributedLock::acquire` returns a `LockToken` on success. Release is
-ownership-checked via a Lua script: `release(key, token)` only deletes the
-key if its current value matches the token. This prevents a caller whose
-lock TTL has already expired from releasing another worker's lock.
+Defined as `DistributedLockPort` in `domain/ports/distributed_lock.rs`.
+Worker components hold `Arc<dyn DistributedLockPort>`, not a concrete
+type, so the implementation is swappable.
+
+`acquire` returns `Option<LockToken>`. Release is ownership-checked: a
+release with a stale token is a no-op, not a delete of the current
+holder's lock. The Redis impl (`infrastructure::redis::distributed_lock::
+RedisDistributedLock`) uses `SET NX EX` for acquire and a Lua check-and-
+delete script for release.
 
 ---
 

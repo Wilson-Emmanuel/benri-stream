@@ -4,8 +4,8 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::sync::watch;
 
+use domain::ports::distributed_lock::DistributedLockPort;
 use domain::ports::task::{TaskPublisher, TaskRepository};
-use infrastructure::redis::distributed_lock::DistributedLock;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_SIZE: i32 = 100;
@@ -15,14 +15,14 @@ const LOCK_TTL_SECS: u64 = 30;
 pub struct OutboxPoller {
     task_repo: Arc<dyn TaskRepository>,
     publisher: Arc<dyn TaskPublisher>,
-    lock: DistributedLock,
+    lock: Arc<dyn DistributedLockPort>,
 }
 
 impl OutboxPoller {
     pub fn new(
         task_repo: Arc<dyn TaskRepository>,
         publisher: Arc<dyn TaskPublisher>,
-        lock: DistributedLock,
+        lock: Arc<dyn DistributedLockPort>,
     ) -> Self {
         Self { task_repo, publisher, lock }
     }
@@ -48,7 +48,12 @@ impl OutboxPoller {
     }
 
     async fn poll_once(&self) -> Result<(), String> {
-        let token = match self.lock.acquire(LOCK_KEY, LOCK_TTL_SECS).await? {
+        let token = match self
+            .lock
+            .acquire(LOCK_KEY, LOCK_TTL_SECS)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             Some(t) => t,
             None => return Ok(()),
         };

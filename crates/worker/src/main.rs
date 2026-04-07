@@ -27,7 +27,7 @@ use infrastructure::storage::s3_client::S3StorageClient;
 use infrastructure::transcoder::gstreamer::GstreamerTranscoder;
 use infrastructure::redis::task_publisher::RedisTaskPublisher;
 use infrastructure::redis::task_consumer::RedisTaskConsumer;
-use infrastructure::redis::distributed_lock::DistributedLock;
+use infrastructure::redis::distributed_lock::RedisDistributedLock;
 
 use handlers::{ErasedHandler, HandlerAdapter, HandlerDispatch, TaskHandlerInvoker};
 use handlers::cleanup_stale::CleanupStaleHandler;
@@ -91,7 +91,7 @@ async fn main() {
         video_repo.clone(), uow.clone(), storage.clone(), transcoder,
     ));
     let cleanup_uc = Arc::new(CleanupStaleVideosUseCase::new(
-        video_repo.clone(), uow.clone(),
+        video_repo.clone(), task_repo.clone(),
     ));
     let delete_video_uc = Arc::new(DeleteVideoUseCase::new(
         video_repo.clone(), uow.clone(), storage.clone(),
@@ -125,18 +125,22 @@ async fn main() {
     let consumer_port: Arc<dyn domain::ports::task::TaskConsumer> =
         Arc::new(RedisTaskConsumer::new(redis_client.clone()));
 
+    // Distributed lock — single shared instance behind the port.
+    let lock: Arc<dyn domain::ports::distributed_lock::DistributedLockPort> =
+        Arc::new(RedisDistributedLock::new(redis_client.clone()));
+
     // Worker components
     let task_consumer = consumer::TaskConsumerLoop::new(
         consumer_port, task_repo.clone(), handler,
     );
     let outbox_poller = poller::OutboxPoller::new(
-        task_repo.clone(), publisher, DistributedLock::new(redis_client.clone()),
+        task_repo.clone(), publisher, lock.clone(),
     );
     let stale_recovery = recovery::StaleRecovery::new(
-        task_repo.clone(), DistributedLock::new(redis_client.clone()),
+        task_repo.clone(), lock.clone(),
     );
     let system_checker = system_checker::SystemTaskChecker::new(
-        task_repo, uow, DistributedLock::new(redis_client),
+        task_repo, uow, lock,
     );
 
     // Shutdown signal — all long-running components observe this and drain

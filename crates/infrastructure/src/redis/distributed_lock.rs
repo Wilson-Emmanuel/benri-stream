@@ -1,4 +1,7 @@
+use async_trait::async_trait;
 use uuid::Uuid;
+
+use domain::ports::distributed_lock::{DistributedLockPort, LockError, LockToken};
 
 /// Redis-backed distributed lock with ownership tokens.
 ///
@@ -6,36 +9,31 @@ use uuid::Uuid;
 /// Release runs a Lua check-and-delete script that only deletes the key if
 /// the stored value still matches the token. This prevents a caller from
 /// accidentally releasing another worker's lock after their own TTL expired.
-pub struct DistributedLock {
+pub struct RedisDistributedLock {
     client: redis::Client,
 }
 
-/// Opaque ownership token returned by `DistributedLock::acquire`. Callers
-/// must pass it back to `release` to release the lock they acquired.
-#[derive(Debug, Clone)]
-pub struct LockToken(String);
-
-impl DistributedLock {
+impl RedisDistributedLock {
     pub fn new(client: redis::Client) -> Self {
         Self { client }
     }
+}
 
-    /// Attempt to acquire the lock. Returns `Some(token)` on success,
-    /// `None` if another holder has the lock.
-    pub async fn acquire(
+#[async_trait]
+impl DistributedLockPort for RedisDistributedLock {
+    async fn acquire(
         &self,
         key: &str,
         ttl_secs: u64,
-    ) -> Result<Option<LockToken>, String> {
+    ) -> Result<Option<LockToken>, LockError> {
         tracing::debug!(key, ttl_secs, "lock: acquire attempt");
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| LockError::Internal(e.to_string()))?;
 
         let token = Uuid::new_v4().to_string();
-        // SET key token NX EX ttl — returns "OK" on success, nil if key exists.
         let set_result: Option<String> = redis::cmd("SET")
             .arg(key)
             .arg(&token)
@@ -44,23 +42,19 @@ impl DistributedLock {
             .arg(ttl_secs)
             .query_async(&mut conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| LockError::Internal(e.to_string()))?;
 
         Ok(set_result.and_then(|s| if s == "OK" { Some(LockToken(token)) } else { None }))
     }
 
-    /// Release the lock. No-op (returns silently) if the token doesn't
-    /// match the current holder — this is the correct behavior for TTL
-    /// expiration followed by another acquirer.
-    pub async fn release(&self, key: &str, token: &LockToken) -> Result<(), String> {
+    async fn release(&self, key: &str, token: &LockToken) -> Result<(), LockError> {
         tracing::debug!(key, "lock: release");
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| LockError::Internal(e.to_string()))?;
 
-        // Compare-and-delete via Lua. Returns 1 if deleted, 0 if token mismatch.
         let script = r#"
             if redis.call("get", KEYS[1]) == ARGV[1] then
                 return redis.call("del", KEYS[1])
@@ -74,7 +68,7 @@ impl DistributedLock {
             .arg(&token.0)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| LockError::Internal(e.to_string()))?;
 
         Ok(())
     }

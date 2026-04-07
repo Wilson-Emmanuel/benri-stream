@@ -67,4 +67,33 @@ impl VideoRepository for PostgresVideoRepository {
             .map(|rows| rows.into_iter().map(row_to_video).collect())
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
+
+    async fn bulk_mark_failed(
+        &self,
+        ids: &[VideoId],
+        from_statuses: &[VideoStatus],
+    ) -> Result<(), RepositoryError> {
+        if ids.is_empty() || from_statuses.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            count = ids.len(),
+            from = ?from_statuses,
+            "db: bulk marking videos failed",
+        );
+        let id_uuids: Vec<uuid::Uuid> = ids.iter().map(|v| v.0).collect();
+        let from_strs: Vec<&'static str> =
+            from_statuses.iter().map(|s| s.as_str()).collect();
+
+        sqlx::query(
+            "UPDATE videos SET status = 'FAILED'
+             WHERE id = ANY($1) AND status = ANY($2)",
+        )
+        .bind(&id_uuids)
+        .bind(&from_strs)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
 }

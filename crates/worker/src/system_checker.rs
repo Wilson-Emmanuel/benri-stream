@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use domain::ports::distributed_lock::DistributedLockPort;
 use domain::ports::task::TaskRepository;
 use domain::ports::unit_of_work::UnitOfWork;
 use domain::task::metadata::cleanup_stale_videos::CleanupStaleVideosTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
-use infrastructure::redis::distributed_lock::DistributedLock;
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 const LOCK_KEY: &str = "benri:task:system_checker:lock";
@@ -24,14 +24,14 @@ const LOCK_TTL_SECS: u64 = 60;
 pub struct SystemTaskChecker {
     task_repo: Arc<dyn TaskRepository>,
     uow: Arc<dyn UnitOfWork>,
-    lock: DistributedLock,
+    lock: Arc<dyn DistributedLockPort>,
 }
 
 impl SystemTaskChecker {
     pub fn new(
         task_repo: Arc<dyn TaskRepository>,
         uow: Arc<dyn UnitOfWork>,
-        lock: DistributedLock,
+        lock: Arc<dyn DistributedLockPort>,
     ) -> Self {
         Self { task_repo, uow, lock }
     }
@@ -57,7 +57,12 @@ impl SystemTaskChecker {
     }
 
     async fn check_once(&self) -> Result<(), String> {
-        let token = match self.lock.acquire(LOCK_KEY, LOCK_TTL_SECS).await? {
+        let token = match self
+            .lock
+            .acquire(LOCK_KEY, LOCK_TTL_SECS)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             Some(t) => t,
             None => return Ok(()),
         };
@@ -95,7 +100,7 @@ impl SystemTaskChecker {
         tracing::info!(metadata_type, "creating missing system task");
         let metadata = make_metadata();
         let mut tx = self.uow.begin().await.map_err(|e| e.to_string())?;
-        TaskScheduler::schedule(tx.tasks(), &metadata, None, None)
+        TaskScheduler::schedule(tx.tasks(), &metadata, None)
             .await
             .map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;

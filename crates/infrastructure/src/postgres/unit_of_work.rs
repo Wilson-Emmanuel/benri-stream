@@ -6,8 +6,6 @@ use domain::ports::video::RepositoryError;
 use domain::task::Task;
 use domain::video::{Video, VideoId, VideoStatus};
 
-use super::task_repository::row_to_task;
-
 pub struct PgUnitOfWork {
     pool: PgPool,
 }
@@ -157,14 +155,12 @@ impl TaskMutations for PgTxScope {
             "INSERT INTO tasks (
                 id, metadata_type, metadata, status, ordering_key, trace_id,
                 attempt_count, next_run_at, error, started_at, completed_at,
-                max_retries, retry_base_delay_ms, execution_interval_ms, processing_timeout_ms,
                 created_at, updated_at
              )
              VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11,
-                $12, $13, $14, $15,
-                $16, $17
+                $12, $13
              )",
         )
         .bind(task.id.0)
@@ -178,10 +174,6 @@ impl TaskMutations for PgTxScope {
         .bind(&task.error)
         .bind(task.started_at)
         .bind(task.completed_at)
-        .bind(task.max_retries)
-        .bind(task.retry_base_delay_ms)
-        .bind(task.execution_interval_ms)
-        .bind(task.processing_timeout_ms)
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut **tx)
@@ -189,32 +181,5 @@ impl TaskMutations for PgTxScope {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         Ok(task.clone())
-    }
-
-    async fn find_active_by_ordering_key(
-        &mut self,
-        metadata_type: &str,
-        ordering_key: &str,
-    ) -> Result<Option<Task>, RepositoryError> {
-        tracing::debug!(
-            metadata_type,
-            ordering_key,
-            "db: dedup lookup by ordering key",
-        );
-        let tx = self.tx_mut()?;
-        let row = sqlx::query(
-            "SELECT * FROM tasks
-             WHERE metadata_type = $1
-               AND ordering_key = $2
-               AND status IN ('PENDING', 'IN_PROGRESS')
-             LIMIT 1",
-        )
-        .bind(metadata_type)
-        .bind(ordering_key)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(row.map(row_to_task))
     }
 }

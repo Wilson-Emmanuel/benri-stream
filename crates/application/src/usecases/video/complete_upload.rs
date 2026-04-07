@@ -111,7 +111,6 @@ impl CompleteUploadUseCase {
             tx.tasks(),
             &ProcessVideoTaskMetadata { video_id: video.id.clone() },
             None,
-            None,
         )
         .await
         .map_err(|e| Error::Internal(e.to_string()))?;
@@ -128,9 +127,9 @@ impl CompleteUploadUseCase {
 }
 
 /// Opens a one-shot tx and schedules a `DeleteVideo` task for the given
-/// video. Idempotent at the schedule level — repeated calls for the same
-/// video while a previous task is still active return the existing task
-/// (dedup-by-default via `TaskScheduler`).
+/// video. Multiple schedules for the same video are safe — the handler
+/// is idempotent and a second-runner sees `VideoNotFound` after the first
+/// completes.
 async fn schedule_delete(
     uow: &Arc<dyn UnitOfWork>,
     video_id: &VideoId,
@@ -139,7 +138,6 @@ async fn schedule_delete(
     TaskScheduler::schedule(
         tx.tasks(),
         &DeleteVideoTaskMetadata { video_id: video_id.clone() },
-        None,
         None,
     )
     .await?;

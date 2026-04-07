@@ -54,20 +54,10 @@ pub trait VideoMutations: Send {
     async fn delete(&mut self, id: &VideoId) -> Result<(), RepositoryError>;
 }
 
-/// Task operations performed inside a `TxScope`. Despite the name, this also
-/// contains the `find_active_by_ordering_key` read — that read must run in the
-/// same transaction as the subsequent `create` call to see uncommitted
-/// concurrent inserts, which is why it lives here instead of on `TaskRepository`.
+/// Task operations performed inside a `TxScope`. Currently only `create` —
+/// the trait exists so use cases can schedule tasks atomically with their
+/// business mutations.
 #[async_trait]
 pub trait TaskMutations: Send {
     async fn create(&mut self, task: &Task) -> Result<Task, RepositoryError>;
-
-    /// Returns the active (`PENDING` or `IN_PROGRESS`) task with the given
-    /// `(metadata_type, ordering_key)` pair, if any. Used by `TaskScheduler`
-    /// for dedup-by-default scheduling.
-    async fn find_active_by_ordering_key(
-        &mut self,
-        metadata_type: &str,
-        ordering_key: &str,
-    ) -> Result<Option<Task>, RepositoryError>;
 }

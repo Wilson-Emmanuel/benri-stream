@@ -5,8 +5,7 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 use domain::ports::task::{TaskConsumer, TaskRepository};
-use domain::task::result::TaskResult;
-use domain::task::TaskStatus;
+use domain::task::{Task, TaskId, TaskStatus};
 
 use crate::handlers::TaskHandlerInvoker;
 
@@ -63,9 +62,9 @@ impl TaskConsumerLoop {
         }
     }
 
-    async fn process_one(&self, task_id: &domain::task::TaskId) {
-        let task = match self.task_repo.find_by_id(task_id).await {
-            Ok(Some(t)) => t,
+    async fn process_one(&self, task_id: &TaskId) {
+        let task: Arc<Task> = match self.task_repo.find_by_id(task_id).await {
+            Ok(Some(t)) => Arc::new(t),
             Ok(None) => {
                 tracing::warn!(task_id = %task_id, "task not found in DB, skipping");
                 return;
@@ -99,29 +98,16 @@ impl TaskConsumerLoop {
             span.record("trace_id", tracing::field::display(tid));
         }
 
-        let timeout = task.processing_timeout();
+        // Dispatcher owns timeout enforcement and compute_update — the
+        // consumer just hands it the task and writes the resulting update.
         let handler = self.handler.clone();
-        let task_for_handler = task.clone();
+        let task_for_dispatch = task.clone();
+        let update = async move { handler.dispatch(&task_for_dispatch).await }
+            .instrument(span)
+            .await;
 
-        let result = async move {
-            match tokio::time::timeout(timeout, handler.dispatch(&task_for_handler)).await {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    tracing::error!(
-                        timeout_secs = timeout.as_secs(),
-                        "task handler timed out",
-                    );
-                    TaskResult::RetryableFailure {
-                        error: format!("handler timed out after {:?}", timeout),
-                        retry_after: None,
-                    }
-                }
-            }
-        }
-        .instrument(span)
-        .await;
-
-        let update = task.compute_update(&result);
+        let metadata_type = task.metadata_type.clone();
+        let outcome_status = update.status;
 
         if let Err(e) = self.task_repo.batch_update(&[update]).await {
             tracing::error!(
@@ -131,30 +117,24 @@ impl TaskConsumerLoop {
             );
         }
 
-        // Metrics by terminal outcome.
-        match &result {
-            TaskResult::Success { .. } => {
-                metrics::counter!(
-                    "task.succeeded",
-                    "metadata_type" => task.metadata_type.clone()
-                )
-                .increment(1);
+        // Metrics by terminal outcome. Skip / Terminate are folded into
+        // succeeded since both end at COMPLETED.
+        match outcome_status {
+            TaskStatus::Completed => {
+                metrics::counter!("task.succeeded", "metadata_type" => metadata_type)
+                    .increment(1);
             }
-            TaskResult::PermanentFailure { .. } => {
-                metrics::counter!(
-                    "task.failed",
-                    "metadata_type" => task.metadata_type.clone()
-                )
-                .increment(1);
+            TaskStatus::DeadLetter => {
+                metrics::counter!("task.failed", "metadata_type" => metadata_type)
+                    .increment(1);
             }
-            TaskResult::RetryableFailure { .. } => {
-                metrics::counter!(
-                    "task.retried",
-                    "metadata_type" => task.metadata_type.clone()
-                )
-                .increment(1);
+            TaskStatus::Pending => {
+                metrics::counter!("task.retried", "metadata_type" => metadata_type)
+                    .increment(1);
             }
-            _ => {}
+            TaskStatus::InProgress => {
+                // Should never happen — compute_update never produces InProgress.
+            }
         }
     }
 }

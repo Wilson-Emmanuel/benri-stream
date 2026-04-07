@@ -16,7 +16,7 @@ impl PostgresTaskRepository {
     }
 }
 
-pub(super) fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
+fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
     let metadata_str: String = row.get("metadata");
     Task {
         id: TaskId(row.get("id")),
@@ -30,10 +30,6 @@ pub(super) fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
         error: row.get("error"),
         started_at: row.get("started_at"),
         completed_at: row.get("completed_at"),
-        max_retries: row.get("max_retries"),
-        retry_base_delay_ms: row.get("retry_base_delay_ms"),
-        execution_interval_ms: row.get("execution_interval_ms"),
-        processing_timeout_ms: row.get("processing_timeout_ms"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -225,12 +221,18 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
-    async fn reset_stale(&self, threshold: DateTime<Utc>) -> Result<i32, RepositoryError> {
+    /// Reset tasks stuck IN_PROGRESS for longer than the global stale
+    /// threshold (1 hour). This is a fixed value, not per-task: every task
+    /// type's `processing_timeout` MUST be less than the threshold so a
+    /// running handler is never reset by stale recovery. Today the limit
+    /// is 30 minutes per task type — see `TaskMetadata` docstring.
+    async fn reset_stale(&self) -> Result<i32, RepositoryError> {
         let result = sqlx::query(
             "UPDATE tasks SET status = 'PENDING', started_at = NULL, updated_at = NOW()
-             WHERE status = 'IN_PROGRESS' AND started_at < $1",
+             WHERE status = 'IN_PROGRESS'
+               AND started_at IS NOT NULL
+               AND started_at < NOW() - INTERVAL '1 hour'",
         )
-        .bind(threshold)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -250,5 +252,79 @@ impl TaskRepository for PostgresTaskRepository {
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(row.0)
+    }
+
+    /// Bulk-insert N tasks in a single statement using `INSERT ... SELECT
+    /// FROM UNNEST(...)`. One round trip, atomic at the statement level.
+    async fn bulk_create(&self, tasks: &[Task]) -> Result<(), RepositoryError> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(count = tasks.len(), "db: bulk creating tasks");
+
+        let ids: Vec<uuid::Uuid> = tasks.iter().map(|t| t.id.0).collect();
+        let metadata_types: Vec<String> =
+            tasks.iter().map(|t| t.metadata_type.clone()).collect();
+        let metadatas: Vec<String> = tasks
+            .iter()
+            .map(|t| serde_json::to_string(&t.metadata))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let statuses: Vec<&'static str> = tasks.iter().map(|t| t.status.as_str()).collect();
+        let ordering_keys: Vec<Option<String>> =
+            tasks.iter().map(|t| t.ordering_key.clone()).collect();
+        let trace_ids: Vec<Option<String>> = tasks.iter().map(|t| t.trace_id.clone()).collect();
+        let attempt_counts: Vec<i32> = tasks.iter().map(|t| t.attempt_count).collect();
+        let next_run_ats: Vec<DateTime<Utc>> = tasks.iter().map(|t| t.next_run_at).collect();
+        let errors: Vec<Option<String>> = tasks.iter().map(|t| t.error.clone()).collect();
+        let started_ats: Vec<Option<DateTime<Utc>>> =
+            tasks.iter().map(|t| t.started_at).collect();
+        let completed_ats: Vec<Option<DateTime<Utc>>> =
+            tasks.iter().map(|t| t.completed_at).collect();
+        let created_ats: Vec<DateTime<Utc>> = tasks.iter().map(|t| t.created_at).collect();
+        let updated_ats: Vec<DateTime<Utc>> = tasks.iter().map(|t| t.updated_at).collect();
+
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (
+                id, metadata_type, metadata, status, ordering_key, trace_id,
+                attempt_count, next_run_at, error, started_at, completed_at,
+                created_at, updated_at
+            )
+            SELECT * FROM UNNEST(
+                $1::uuid[],
+                $2::varchar[],
+                $3::text[],
+                $4::varchar[],
+                $5::varchar[],
+                $6::varchar[],
+                $7::int4[],
+                $8::timestamptz[],
+                $9::text[],
+                $10::timestamptz[],
+                $11::timestamptz[],
+                $12::timestamptz[],
+                $13::timestamptz[]
+            )
+            "#,
+        )
+        .bind(&ids)
+        .bind(&metadata_types)
+        .bind(&metadatas)
+        .bind(&statuses)
+        .bind(&ordering_keys)
+        .bind(&trace_ids)
+        .bind(&attempt_counts)
+        .bind(&next_run_ats)
+        .bind(&errors)
+        .bind(&started_ats)
+        .bind(&completed_ats)
+        .bind(&created_ats)
+        .bind(&updated_ats)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(())
     }
 }

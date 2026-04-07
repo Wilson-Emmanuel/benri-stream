@@ -24,11 +24,12 @@ impl std::fmt::Display for TaskId {
 
 /// A scheduled or in-flight task.
 ///
-/// Scheduling config (`max_retries`, `retry_base_delay_ms`,
-/// `execution_interval_ms`, `processing_timeout_ms`) is denormalized from the
-/// concrete `TaskMetadata` at schedule time and persisted as columns. This
-/// lets the consumer and `compute_update` operate without reconstructing the
-/// typed metadata from the JSON payload.
+/// **Scheduling config (max_retries, retry_base_delay, execution_interval,
+/// processing_timeout) is NOT stored on the row.** It lives on the typed
+/// `TaskMetadata` impl and is read at run time. The consumer's `HandlerAdapter`
+/// deserializes the metadata before computing the update so the live trait
+/// values are used. This means config changes apply immediately on the next
+/// task run without a migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -42,13 +43,6 @@ pub struct Task {
     pub error: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
-
-    // Denormalized scheduling config (see struct docstring).
-    pub max_retries: Option<i32>,
-    pub retry_base_delay_ms: i64,
-    pub execution_interval_ms: Option<i64>,
-    pub processing_timeout_ms: i64,
-
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -57,43 +51,34 @@ const MAX_RETRY_BACKOFF_SECS: i64 = 30 * 60;
 const MAX_BACKOFF_EXPONENT: i32 = 10;
 
 impl Task {
-    pub fn processing_timeout(&self) -> Duration {
-        Duration::from_millis(self.processing_timeout_ms.max(0) as u64)
-    }
-
-    pub fn is_recurring(&self) -> bool {
-        self.execution_interval_ms.is_some()
-    }
-
-    pub fn can_retry(&self) -> bool {
-        match self.max_retries {
-            Some(max) => self.attempt_count < max,
-            None => false,
-        }
-    }
-
-    /// Exponential backoff: `retry_base_delay_ms * 2^attempt_count`, capped
-    /// at 30 minutes. The exponent is clamped at 10 to prevent overflow.
-    pub fn calculate_retry_delay(&self) -> chrono::Duration {
-        let exp = self.attempt_count.min(MAX_BACKOFF_EXPONENT) as u32;
-        let delay_ms = self
-            .retry_base_delay_ms
-            .saturating_mul(1i64 << exp);
-        let capped_secs = (delay_ms / 1000).min(MAX_RETRY_BACKOFF_SECS);
-        chrono::Duration::seconds(capped_secs.max(0))
-    }
-
-    /// Pure function: given a `TaskResult`, compute the `TaskUpdate`
-    /// representing the next DB state. No side effects, no DB access.
-    pub fn compute_update(&self, result: &result::TaskResult) -> TaskUpdate {
+    /// Pure function: given the typed metadata and a `TaskResult`, compute
+    /// the `TaskUpdate` representing the next DB state. No side effects, no
+    /// DB access.
+    ///
+    /// Generic over `M: TaskMetadata` because the per-task scheduling config
+    /// (max retries, base delay, interval) lives on the trait, not on the row.
+    /// The caller (typically `HandlerAdapter`) is responsible for
+    /// deserializing the typed metadata from `task.metadata` and passing it.
+    ///
+    /// Note: `Skip` and `Terminate` outcomes write their reason into the
+    /// `error` column prefixed with `"Skipped: "` / `"Terminated: "`. The
+    /// `error` column doubles as a "last message" channel since there's no
+    /// dedicated last-message column. Filter on the prefix when querying
+    /// for actual failures.
+    pub fn compute_update<M: TaskMetadata>(
+        &self,
+        metadata: &M,
+        result: &result::TaskResult,
+    ) -> TaskUpdate {
         let now = Utc::now();
         match result {
             result::TaskResult::Success { reschedule_after, .. } => {
                 let next_run_at = reschedule_after
                     .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64))
                     .or_else(|| {
-                        self.execution_interval_ms
-                            .map(|ms| now + chrono::Duration::milliseconds(ms))
+                        metadata
+                            .execution_interval()
+                            .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64))
                     });
 
                 if let Some(next) = next_run_at {
@@ -123,11 +108,10 @@ impl Task {
 
             result::TaskResult::RetryableFailure { error, retry_after } => {
                 let new_attempt = self.attempt_count + 1;
-                // can_retry checks the PRE-increment attempt_count against
-                // max_retries. If attempt_count < max_retries, the post-fail
-                // retry is allowed; otherwise we've exhausted retries and
-                // dead-letter.
-                let can_retry = self.can_retry();
+                let can_retry = match metadata.max_retries() {
+                    Some(max) => self.attempt_count < max,
+                    None => false,
+                };
 
                 if !can_retry {
                     TaskUpdate {
@@ -140,11 +124,9 @@ impl Task {
                         updated_at: now,
                     }
                 } else {
-                    // Backoff uses the PRE-increment attempt_count: first
-                    // retry (from attempt_count = 0) delays by `base * 2^0 = base`.
                     let delay = retry_after
                         .map(|d| chrono::Duration::milliseconds(d.as_millis() as i64))
-                        .unwrap_or_else(|| self.calculate_retry_delay());
+                        .unwrap_or_else(|| calculate_retry_delay(metadata, self.attempt_count));
                     TaskUpdate {
                         task_id: self.id.clone(),
                         status: TaskStatus::Pending,
@@ -168,14 +150,15 @@ impl Task {
             },
 
             result::TaskResult::Skip { reason } => {
-                // Recurring tasks reschedule on skip (preconditions not met,
-                // try again next interval). One-shot tasks are marked completed.
-                if let Some(ms) = self.execution_interval_ms {
+                // Recurring tasks reschedule on skip; one-shot → Completed.
+                if let Some(interval) = metadata.execution_interval() {
                     TaskUpdate {
                         task_id: self.id.clone(),
                         status: TaskStatus::Pending,
                         attempt_count: self.attempt_count,
-                        next_run_at: Some(now + chrono::Duration::milliseconds(ms)),
+                        next_run_at: Some(
+                            now + chrono::Duration::milliseconds(interval.as_millis() as i64),
+                        ),
                         error: Some(format!("Skipped: {}", reason)),
                         completed_at: None,
                         updated_at: now,
@@ -204,6 +187,16 @@ impl Task {
             },
         }
     }
+}
+
+/// Exponential backoff: `base * 2^attempt_count`, capped at 30 minutes.
+/// The exponent is clamped at 10 to prevent overflow.
+fn calculate_retry_delay<M: TaskMetadata>(metadata: &M, attempt_count: i32) -> chrono::Duration {
+    let base_ms = metadata.retry_base_delay().as_millis() as i64;
+    let exp = attempt_count.min(MAX_BACKOFF_EXPONENT) as u32;
+    let delay_ms = base_ms.saturating_mul(1i64 << exp);
+    let capped_secs = (delay_ms / 1000).min(MAX_RETRY_BACKOFF_SECS);
+    chrono::Duration::seconds(capped_secs.max(0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,8 +234,14 @@ impl TaskStatus {
 /// The `METADATA_TYPE` associated const (declared directly on the impl struct)
 /// should equal the struct name and match the key used when registering the
 /// handler in the dispatch map. `metadata_type_name()` returns that const.
+///
+/// **Processing timeout limit**: each task type's `processing_timeout()` MUST
+/// be less than `STALE_RECOVERY_THRESHOLD - STALE_RECOVERY_BUFFER` so that
+/// stale recovery never resets a task that's still legitimately running. The
+/// current limit is 30 minutes (the global threshold is 1 hour).
 pub trait TaskMetadata: Send + Sync + Serialize + DeserializeOwned {
     /// Max time the consumer will wait for the handler before cancelling.
+    /// MUST be less than 30 minutes — see trait docstring.
     fn processing_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
@@ -265,8 +264,11 @@ pub trait TaskMetadata: Send + Sync + Serialize + DeserializeOwned {
         Duration::from_secs(30)
     }
 
-    /// Tasks with the same ordering key are processed sequentially and are
-    /// dedup-by-default on schedule.
+    /// Tasks with the same ordering key are processed sequentially (no two
+    /// active at once with the same key, enforced by `find_pending`'s CTE).
+    /// Used for resource serialization, not deduplication — handlers must
+    /// be idempotent because at-least-once delivery may invoke the same
+    /// handler twice.
     fn ordering_key(&self) -> Option<String> {
         None
     }
