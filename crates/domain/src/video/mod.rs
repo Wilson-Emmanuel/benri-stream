@@ -40,10 +40,7 @@ impl Video {
     }
 
     pub fn is_streamable(&self) -> bool {
-        matches!(
-            self.status,
-            VideoStatus::Partial | VideoStatus::Processed | VideoStatus::Incomplete
-        )
+        matches!(self.status, VideoStatus::Processed)
     }
 
     pub fn storage_prefix(&self) -> String {
@@ -64,9 +61,7 @@ pub enum VideoStatus {
     PendingUpload,
     Uploaded,
     Processing,
-    Partial,
     Processed,
-    Incomplete,
     Failed,
 }
 
@@ -76,9 +71,7 @@ impl VideoStatus {
             Self::PendingUpload => "PENDING_UPLOAD",
             Self::Uploaded => "UPLOADED",
             Self::Processing => "PROCESSING",
-            Self::Partial => "PARTIAL",
             Self::Processed => "PROCESSED",
-            Self::Incomplete => "INCOMPLETE",
             Self::Failed => "FAILED",
         }
     }
@@ -88,9 +81,7 @@ impl VideoStatus {
             "PENDING_UPLOAD" => Self::PendingUpload,
             "UPLOADED" => Self::Uploaded,
             "PROCESSING" => Self::Processing,
-            "PARTIAL" => Self::Partial,
             "PROCESSED" => Self::Processed,
-            "INCOMPLETE" => Self::Incomplete,
             "FAILED" => Self::Failed,
             _ => Self::Failed,
         }

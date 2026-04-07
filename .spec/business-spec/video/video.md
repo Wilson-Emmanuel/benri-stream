@@ -15,6 +15,7 @@ See use cases below for details on each step.
 |------|--------|--------|
 | 2026-04-03 | Initial spec | Wilson |
 | 2026-04-06 | Split deletion into UC-VID-007 (`DeleteVideo` task). UC-VID-002 and UC-VID-005 schedule it directly on rejection/failure paths. UC-VID-006 becomes a safety-net sweep that schedules instead of mutating. FAILED retention reduced from 30 days to 24 hours. | Wilson |
+| 2026-04-07 | Drop `PARTIAL` and `INCOMPLETE` from the lifecycle. Share token is now generated only when transcoding completes successfully (`Processing → Processed`). Probe + the upload-time validations are sufficient evidence the file is good; the previous "first segment" early-stream mechanism added significant complexity (callback plumbing, segment counting, branching error handling) without delivering the promised early time-to-stream — the implementation always ran the pipeline to completion before doing anything. Transcode failures now mark the whole video failed and schedule deletion; we no longer try to preserve partial output. | Wilson |
 
 ---
 
@@ -25,7 +26,7 @@ See use cases below for details on each step.
 | Attribute | Type | Nullable | Description |
 |-----------|------|----------|-------------|
 | `id` | Unique identifier | No | Internal system identifier |
-| `shareToken` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until first segment is produced. URL-safe |
+| `shareToken` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until processing completes successfully. URL-safe |
 | `title` | Text (1–100 chars) | No | User-provided title, displayed on the player page. Frontend pre-fills from filename |
 | `format` | Video Format (see Enums) | No | Determined from MIME type on upload, validated via file signature on complete |
 | `status` | Video Status (see Enums) | No | Current lifecycle state |
@@ -41,10 +42,8 @@ See use cases below for details on each step.
 | `PENDING_UPLOAD` | Presigned URL issued, waiting for client to upload to storage |
 | `UPLOADED` | File in storage, queued for processing |
 | `PROCESSING` | Being converted into streaming format |
-| `PARTIAL` | Watchable from the beginning, later parts still being processed |
-| `PROCESSED` | Fully processed and watchable at all quality levels |
-| `INCOMPLETE` | Processing failed partway. Whatever succeeded is streamable — video ends earlier |
-| `FAILED` | No segments produced. No shareable link generated |
+| `PROCESSED` | Fully processed and watchable. Share token has been generated |
+| `FAILED` | Processing failed at any point. No shareable link generated; video is scheduled for deletion |
 
 #### Video Format
 
@@ -165,7 +164,7 @@ signature (magic bytes), and checks actual size from storage metadata.
 **Triggered by**: REST: `GET /api/videos/{id}/status`
 
 Polling endpoint. Returns current status and the shareable link once it's available
-(after first segment is produced).
+(after processing completes successfully).
 
 **Input**
 
@@ -182,7 +181,7 @@ Polling endpoint. Returns current status and the shareable link once it's availa
 | Field | Description |
 |-------|-------------|
 | `status` | Current status |
-| `shareUrl` | Full shareable URL. Null until first segment is produced |
+| `shareUrl` | Full shareable URL. Null until processing completes successfully |
 
 **Error Codes**
 
@@ -237,10 +236,12 @@ Fetches video metadata and streaming info for the player page.
 
 **Actor**: System — not user-facing
 
-**Triggered by**: Worker polls for videos with `status = UPLOADED`
+**Triggered by**: Worker consumes the `ProcessVideo` task scheduled by
+[UC-VID-002](#uc-vid-002) on successful upload completion.
 
-Probes the file, transcodes segment by segment, and writes output directly to storage.
-The shareable link is generated after the first segment succeeds.
+Probes the file, transcodes it into adaptive HLS, and uploads the segments.
+On success, the share token is generated and the status flips to `PROCESSED`
+in a single atomic update.
 
 **Input**
 
@@ -250,30 +251,29 @@ The shareable link is generated after the first segment succeeds.
 
 **Guards**
 1. Video exists and status is `UPLOADED`
-2. Original file exists in storage
+2. Original file exists in storage (validated implicitly by the probe)
 
-**Mutations** (progressive)
+**Mutations**
 1. Atomically set `status = PROCESSING` (only if still `UPLOADED`). If not, skip — another worker claimed it.
-2. Probe the file — confirm it's a valid, processable video
-3. Transcode first segment at all configured quality levels, writing output directly to storage
-4. On first segment success → generate `shareToken`, set `status = PARTIAL`
-5. Continue transcoding remaining segments directly to storage
-6. On completion → set `status = PROCESSED`
-7. Delete original upload from storage (HLS output is kept). Best-effort —
-   a failure here leaves an orphan that the cleanup safety-net (UC-VID-006) collects.
+2. Probe the file — confirm it's a valid, decodable video and capture stream info
+3. Transcode the full video into adaptive HLS, uploading segments to storage
+4. On success → atomically set `shareToken` and `status = PROCESSED` in one statement
+5. Delete original upload from storage. Best-effort — a failure here leaves
+   an orphan that the cleanup safety-net (UC-VID-006) collects.
 
-On probe failure:
+On probe failure or transcode failure:
 - Atomically set `status = FAILED` and schedule a `DeleteVideo` task
-  ([UC-VID-007](#uc-vid-007)) in the same DB transaction. The task removes the
-  original upload and the video record after the FAILED retention window.
+  ([UC-VID-007](#uc-vid-007)) in the same DB transaction. The task removes
+  the original upload and the video record.
 - No share token generated — uploader sees FAILED when polling.
 
-On segment failure:
-- If some segments already succeeded: set `status = INCOMPLETE`,
-  delete the original upload (HLS output is kept). Video is streamable up to
-  that point. INCOMPLETE videos are NOT scheduled for deletion.
-- If no segments succeeded: atomically set `status = FAILED` and schedule a
-  `DeleteVideo` task in the same DB transaction. No share token generated.
+**Why no early-stream / partial-success handling**: probe + the upload-time
+validations (client-side type/size check, server-side magic-byte signature
+check) provide strong evidence the file is good before we start transcoding.
+A previous design attempted to expose the video as soon as the first segment
+was produced (a `PARTIAL` state) and to preserve partial output on mid-pipeline
+failures (an `INCOMPLETE` state); both added significant complexity without
+real benefit and were dropped on 2026-04-07.
 
 **Output**: N/A (system process)
 
@@ -281,10 +281,11 @@ On segment failure:
 
 **Side Effects**
 
-- On probe failure or zero-segments failure: schedules `DeleteVideo`
+- On probe or transcode failure: schedules `DeleteVideo`
   ([UC-VID-007](#uc-vid-007)) in the same transaction as the `FAILED` status update.
 
-**Idempotency**: Idempotent — re-running on PROCESSED is a no-op.
+**Idempotency**: Idempotent — re-running on `PROCESSED` is a no-op (the
+initial `update_status_if(Uploaded → Processing)` returns false).
 
 ---
 
@@ -310,7 +311,7 @@ so retries, ordering, and dedup are uniform across the system.
 - `UPLOADED` or `PROCESSING` older than 24 hours with no progress →
   atomically set `status = FAILED` and schedule `DeleteVideo` (same transaction)
 - `FAILED` videos older than 24 hours → schedule `DeleteVideo`
-- `INCOMPLETE` videos are NOT cleaned up — they have working segments and are streamable
+- `PROCESSED` videos are kept indefinitely
 
 Scheduling is dedup-by-default: re-running the sweep will not create duplicate
 `DeleteVideo` tasks for the same video while a previous task is still active
@@ -385,4 +386,4 @@ or missing object is a no-op at every step.
 | Adaptive streaming | Videos are transcoded into multiple quality levels; the player automatically selects the best quality for the viewer's connection | Processing pipeline |
 | Stale upload/processing timeout | 24 hours | Cleanup task |
 | Failed video retention | 24 hours | Cleanup task |
-| Share token length | 21 chars | Generated on first segment success |
+| Share token length | 21 chars | Generated when processing completes successfully |

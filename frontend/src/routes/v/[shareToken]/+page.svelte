@@ -14,7 +14,7 @@
 			video = await getVideoByToken(shareToken);
 			if (video.stream_url) {
 				initPlayer(video.stream_url);
-			} else if (video.status === 'Processing' || video.status === 'Partial') {
+			} else if (video.status === 'Processing') {
 				pollUntilReady();
 			}
 		} catch (err) {
@@ -93,11 +93,6 @@
 					playsinline
 				></video>
 			</div>
-			{#if video.status === 'Partial' || video.status === 'Incomplete'}
-				<p class="status-note">
-					{video.status === 'Partial' ? 'Still processing — more of the video will become available.' : ''}
-				</p>
-			{/if}
 		</div>
 	{/if}
 </main>

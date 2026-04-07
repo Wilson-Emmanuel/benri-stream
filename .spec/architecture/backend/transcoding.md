@@ -88,14 +88,17 @@ pub trait TranscoderPort: Send + Sync {
         &self,
         input_key: &str,
         output_prefix: &str,
-        on_first_segment: Box<dyn FnOnce() + Send>,
-    ) -> Result<TranscodeResult, TranscoderError>;
+        probe: &ProbeResult,
+    ) -> Result<(), TranscoderError>;
 }
 ```
 
-The `on_first_segment` callback notifies the use case when the first segment is ready
-(triggers share token generation). The trait knows nothing about how transcoding happens —
-quality levels, codecs, and segment config are internal to the infrastructure implementation.
+`probe()` validates the file is decodable AND captures stream-level details
+(`has_audio`, dimensions, codec) so `transcode_to_hls` doesn't have to re-read
+headers from S3. The trait knows nothing about how transcoding happens —
+quality levels, codecs, and segment config are internal to the infrastructure
+implementation. Transcode either runs to completion or fails wholesale; there
+is no partial-success path.
 
 **Implementation** (infrastructure):
 ```rust
@@ -151,7 +154,7 @@ settings are implementation details in the infrastructure.
 | What | Crate | Path |
 |------|-------|------|
 | `TranscoderPort` trait | `domain` | `src/ports/transcoder.rs` |
-| `TranscoderError`, `ProbeResult`, `TranscodeResult` | `domain` | `src/ports/transcoder.rs` |
+| `TranscoderError`, `ProbeResult` | `domain` | `src/ports/transcoder.rs` |
 | `QualityLevel` enum (resolution, bitrate) | `infrastructure` | `src/transcoder/quality.rs` |
 | `GstreamerTranscoder` implementation | `infrastructure` | `src/transcoder/gstreamer.rs` |
 | Wiring (construct transcoder, pass to use cases) | `worker` | `src/main.rs` |

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use domain::ports::storage::StoragePort;
-use domain::ports::transcoder::{ProbeResult, TranscodeResult, TranscoderError, TranscoderPort};
+use domain::ports::transcoder::{ProbeResult, TranscoderError, TranscoderPort};
 
 use super::quality::QualityLevel;
 
@@ -65,15 +65,12 @@ impl GstreamerTranscoder {
     ///
     /// `has_audio` is determined upstream by `probe()` and threaded in,
     /// so we don't have to re-read the file headers from S3.
-    ///
-    /// Returns the number of .ts segments produced per level, in the same
-    /// order as the input slice.
     fn run_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
         quality_levels: &[QualityLevel],
         has_audio: bool,
-    ) -> Result<Vec<u32>, TranscoderError> {
+    ) -> Result<(), TranscoderError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
@@ -336,28 +333,7 @@ impl GstreamerTranscoder {
             return Err(TranscoderError::TranscodeFailed(err_msg));
         }
 
-        // Count produced .ts segments per level
-        let counts: Vec<u32> = quality_levels
-            .iter()
-            .map(|level| {
-                let level_dir = output_dir.join(level.name());
-                std::fs::read_dir(&level_dir)
-                    .map(|entries| {
-                        entries
-                            .filter_map(|e| e.ok())
-                            .filter(|e| {
-                                e.path()
-                                    .extension()
-                                    .map(|ext| ext == "ts")
-                                    .unwrap_or(false)
-                            })
-                            .count() as u32
-                    })
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        Ok(counts)
+        Ok(())
     }
 }
 
@@ -421,8 +397,7 @@ impl TranscoderPort for GstreamerTranscoder {
         input_key: &str,
         output_prefix: &str,
         probe: &ProbeResult,
-        on_first_segment: Box<dyn FnOnce() + Send>,
-    ) -> Result<TranscodeResult, TranscoderError> {
+    ) -> Result<(), TranscoderError> {
         use gstreamer as gst;
 
         tracing::info!(
@@ -446,11 +421,10 @@ impl TranscoderPort for GstreamerTranscoder {
 
         let quality_levels = QualityLevel::all().to_vec();
 
-        // Run one GStreamer pipeline that decodes the input once and fans out
-        // to N encoder branches in parallel (see `run_parallel_pipeline`).
-        // GStreamer blocks on the bus, so we run the whole thing in
-        // spawn_blocking.
-        let segment_counts = {
+        // Run one GStreamer pipeline that decodes the input once and fans
+        // out to N encoder branches in parallel. GStreamer blocks on the
+        // bus, so we run the whole thing in spawn_blocking.
+        {
             let url = input_url.clone();
             let dir = temp_path.clone();
             let levels = quality_levels.clone();
@@ -458,21 +432,13 @@ impl TranscoderPort for GstreamerTranscoder {
                 Self::run_parallel_pipeline(&url, &dir, &levels, has_audio)
             })
             .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??
-        };
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??;
+        }
 
-        // Upload the produced segments per level and fire `on_first_segment`
-        // once we've uploaded the first level that actually has segments.
-        // Wrap the FnOnce callback in Option so we can `take()` it — the
-        // compiler can't statically prove the loop body calls it at most once.
-        let mut on_first_segment: Option<Box<dyn FnOnce() + Send>> = Some(on_first_segment);
-        let mut total_segments: u32 = 0;
-
-        for (level, count) in quality_levels.iter().zip(segment_counts.iter()) {
-            if *count == 0 {
-                continue;
-            }
-
+        // Upload all per-level outputs (segments + per-level playlist).
+        // The pipeline ran to EOS without error, so each level dir has
+        // its full output.
+        for level in &quality_levels {
             let level_dir = temp_path.join(level.name());
             let mut entries: Vec<_> = std::fs::read_dir(&level_dir)
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("readdir: {e}")))?
@@ -492,36 +458,25 @@ impl TranscoderPort for GstreamerTranscoder {
 
                 Self::upload_and_delete(storage.as_ref(), &path, &s3_key, content_type).await?;
             }
-
-            total_segments += count;
-
-            // Fire on the first level that produced segments.
-            if let Some(cb) = on_first_segment.take() {
-                cb();
-            }
         }
 
         // Generate and upload master playlist
-        if total_segments > 0 {
-            let master_content = Self::generate_master_playlist(&quality_levels);
-            let master_path = temp_path.join("master.m3u8");
-            std::fs::write(&master_path, &master_content)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("write master: {e}")))?;
+        let master_content = Self::generate_master_playlist(&quality_levels);
+        let master_path = temp_path.join("master.m3u8");
+        std::fs::write(&master_path, &master_content)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("write master: {e}")))?;
 
-            let master_key = format!("{}master.m3u8", output_prefix);
-            Self::upload_and_delete(
-                storage.as_ref(),
-                &master_path,
-                &master_key,
-                "application/vnd.apple.mpegurl",
-            )
-            .await?;
-        }
+        let master_key = format!("{}master.m3u8", output_prefix);
+        Self::upload_and_delete(
+            storage.as_ref(),
+            &master_path,
+            &master_key,
+            "application/vnd.apple.mpegurl",
+        )
+        .await?;
 
         // Temp dir is cleaned up on drop
-        Ok(TranscodeResult {
-            segments_produced: total_segments,
-        })
+        Ok(())
     }
 }
 

@@ -69,8 +69,7 @@ graph LR
 
     DB[(PostgreSQL)]
 
-    Sink1 -.->|First segment done<br/>→ generate shareToken<br/>→ status=PARTIAL| DB
-    Sink3 -.->|All segments done<br/>→ status=PROCESSED| DB
+    Sink3 -.->|All segments done<br/>→ generate shareToken<br/>→ status=PROCESSED| DB
 
     style Source fill:#569a31,color:#fff
     style Sink1 fill:#569a31,color:#fff

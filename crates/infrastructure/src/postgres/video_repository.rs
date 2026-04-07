@@ -110,15 +110,22 @@ impl VideoRepository for PostgresVideoRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn set_share_token(&self, id: &VideoId, token: &str) -> Result<(), RepositoryError> {
-        tracing::info!(video_id = %id, "db: setting video share token");
-        sqlx::query("UPDATE videos SET share_token = $2 WHERE id = $1")
-            .bind(id.0)
-            .bind(token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        Ok(())
+    async fn mark_processed(
+        &self,
+        id: &VideoId,
+        share_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        tracing::info!(video_id = %id, "db: marking video processed");
+        let result = sqlx::query(
+            "UPDATE videos SET share_token = $2, status = 'PROCESSED'
+             WHERE id = $1 AND status = 'PROCESSING'",
+        )
+        .bind(id.0)
+        .bind(share_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn delete(&self, id: &VideoId) -> Result<(), RepositoryError> {

@@ -40,9 +40,9 @@ A few things weren't specified. I made assumptions and designed around them.
 | Upload up to 1GB | Presigned URL with size policy + server-side validation via range read | [UC-VID-001, UC-VID-002](.spec/business-spec/video/video.md) |
 | Common formats | MP4, WebM, MOV, AVI, MKV — validated by file signature (magic bytes) | [Video spec](.spec/business-spec/video/video.md) |
 | Anonymous upload | No auth, no accounts — by design | |
-| Shareable link | Generated after first segment succeeds — link is guaranteed watchable | [UC-VID-005](.spec/business-spec/video/video.md), [Shareable link decision](#shareable-link-after-first-segment) |
+| Shareable link | Generated when transcoding completes — link is guaranteed watchable | [UC-VID-005](.spec/business-spec/video/video.md) |
 | Browser streaming | HLS via hls.js (all browsers), native on Safari/iOS | [Frontend SPA](.spec/architecture/frontend/spa.md) |
-| Time-to-stream > quality | Parallel encoding (low finishes first), 4-second segments, progressive status (PARTIAL) | [Parallel encoding decision](#parallel-encoding-over-sequential-passes), [Segment duration decision](#4-second-hls-segments) |
+| Time-to-stream > quality | Parallel encoding (decode once, encode 3 levels in parallel), 4-second segments, fast x264 preset | [Parallel encoding decision](#parallel-encoding-over-sequential-passes), [Segment duration decision](#4-second-hls-segments) |
 | Horizontal scaling (bonus) | Stateless workers (nothing persists between jobs), queue-based task dispatch, distributed lock for poller | [Task system](.spec/architecture/backend/task-system.md) |
 | Cost efficiency (bonus) | CDN edge-caches segments (origin hit once), presigned URLs bypass API server, original file discarded after processing | [CDN decision](#cdn-as-core-architecture), [Presigned URL decision](#presigned-url-upload) |
 | Consistent playback (bonus) | Adaptive bitrate HLS (3 quality levels), CDN edge serving | [Transcoding](.spec/architecture/backend/transcoding.md) |
@@ -255,16 +255,22 @@ capability is a deployment decision: more powerful instances = fewer workers nee
 and vice versa. GPU is not required — CPU-only works at any scale, just needs more
 instances.
 
-### Shareable link after first segment
+### Shareable link generated on successful processing
 
-The link is generated only after the first segment is successfully produced.
+The link is generated only when transcoding completes successfully — the share token
+and the `PROCESSED` status are set in a single atomic SQL update.
 
-I considered generating it earlier (on upload or after probe), but then the user would be
-holding a link to something that might never work. Cleanup handles the record, but the
-user may have already shared the link and viewers would see an error.
+I considered generating it earlier (on upload or after probe), but then the user would
+be holding a link to something that might never work. Probe is good evidence the file
+is decodable, but the actual transcoding can still fail and we'd be left with a live
+link to a broken video.
 
-After first segment, the link is guaranteed watchable. This doesn't affect time-to-stream
-— viewers can't watch until segments exist regardless of when the link was generated.
+I also considered an "early stream" approach (generate the link as soon as the first
+segment hits storage, viewer watches the first part while the rest transcodes). This
+adds significant complexity — segment-level signal handling, callback plumbing, an
+intermediate `PARTIAL` state, partial-failure recovery — for limited benefit on
+typical user uploads. Dropped in favor of the simpler "link only when fully ready"
+model.
 
 ### CDN as core architecture
 
@@ -316,12 +322,14 @@ upload session token could be added.
 Only HLS output is kept. The original can be reconstructed from segments by remuxing
 (no re-encoding, no quality loss). Keeping both roughly doubles storage per video.
 
-### Partial failure keeps successful segments
+### Wholesale failure on transcode error
 
-By the time processing fails partway, the shareable link is already live — the uploader
-has it, may have shared it, viewers may be watching. Marking the whole video as failed
-would break an active viewing experience. The segments that succeeded are valid and
-watchable. Total failure (probe fails, zero segments) never generates a link.
+If transcoding fails at any point — probe failure, mid-pipeline error, anything — the
+whole video is marked `FAILED` and scheduled for deletion. We don't try to preserve
+partial output. The earlier design carried `PARTIAL`/`INCOMPLETE` states for this, but
+since the share token is only generated on full success (above), there's never a live
+link pointing at a half-broken video, so partial recovery has no user-visible benefit.
+Simpler model, less code, same UX.
 
 ### Client-side + server-side validation
 

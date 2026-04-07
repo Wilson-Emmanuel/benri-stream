@@ -32,7 +32,16 @@ pub trait VideoRepository: Send + Sync {
         new_status: VideoStatus,
     ) -> Result<bool, RepositoryError>;
 
-    async fn set_share_token(&self, id: &VideoId, token: &str) -> Result<(), RepositoryError>;
+    /// Atomically transition `Processing → Processed` and write the
+    /// share token in one statement. Returns `true` if a row was updated;
+    /// `false` means the video was no longer in `Processing` (e.g.
+    /// recovered to `Failed` by the safety-net sweep). Single statement,
+    /// no transaction needed.
+    async fn mark_processed(
+        &self,
+        id: &VideoId,
+        share_token: &str,
+    ) -> Result<bool, RepositoryError>;
 
     async fn delete(&self, id: &VideoId) -> Result<(), RepositoryError>;
 

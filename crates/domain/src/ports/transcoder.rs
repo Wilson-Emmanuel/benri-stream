@@ -9,8 +9,7 @@ pub trait TranscoderPort: Send + Sync {
         input_key: &str,
         output_prefix: &str,
         probe: &ProbeResult,
-        on_first_segment: Box<dyn FnOnce() + Send>,
-    ) -> Result<TranscodeResult, TranscoderError>;
+    ) -> Result<(), TranscoderError>;
 }
 
 #[derive(Debug, Clone)]
@@ -23,11 +22,6 @@ pub struct ProbeResult {
     /// `probe()` so the transcoder doesn't have to re-read the file
     /// headers to find out.
     pub has_audio: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TranscodeResult {
-    pub segments_produced: u32,
 }
 
 #[derive(Debug, thiserror::Error)]

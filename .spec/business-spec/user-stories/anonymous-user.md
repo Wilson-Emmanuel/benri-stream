@@ -22,25 +22,12 @@ Standard controls — pause, seek, fullscreen, irrespective of the uploaded file
 
 ---
 
-## 3. Progressive Availability
+## 3. Damaged or Unusable File
 
-User uploads a long lecture. The video becomes watchable from the beginning before the
-whole thing is fully ready. People clicking the link can start watching right away.
+User uploads a file that's damaged or that looks like a video but isn't decodable. The
+system probes it before transcoding. If the probe fails, or if transcoding errors out
+mid-stream, the video is marked failed and scheduled for deletion. No shareable link
+is generated. The user sees an error after uploading.
 
----
-
-## 4. Partially Broken File
-
-User uploads a file that's damaged halfway through. The first half plays fine — the
-video just ends earlier than expected. Viewers aren't shown an error. (See
-[clarifications #8](../../clarifications.md) — I'm assuming keep-what-works, pending
-confirmation.)
-
-Validation catches obviously bad files before upload to reduce the chance of this.
-
----
-
-## 5. Completely Unusable File
-
-User uploads a file that looks like a video but isn't. The system can't do anything with
-it. No shareable link is ever generated. The user sees an error after uploading.
+Validation catches obviously bad files before upload (client-side type check, server-side
+magic-byte signature check) to reduce wasted work.
