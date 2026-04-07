@@ -180,12 +180,10 @@ filter out rows whose error starts with `"Skipped: "` / `"Terminated: "`.
 ### Ports
 
 ```rust
-// In crates/domain/src/task/ports.rs
+// Pool-backed ops live in crates/domain/src/ports/task.rs
 
-/// Worker-internal task lifecycle operations + bulk creation. Single-task
-/// creation from use cases goes through TaskScheduler + TaskMutations
-/// inside a TxScope. Bulk creation is pool-backed since one INSERT
-/// statement is atomic and has nothing to bundle with.
+/// Pool-backed task operations: reads, lifecycle, single + bulk inserts.
+/// Use for scheduling that doesn't need to be atomic with another write.
 pub trait TaskRepository: Send + Sync {
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError>;
     async fn find_by_ids(&self, ids: &[TaskId]) -> Result<Vec<Task>, RepositoryError>;
@@ -194,10 +192,14 @@ pub trait TaskRepository: Send + Sync {
     async fn batch_update(&self, updates: &[TaskUpdate]) -> Result<(), RepositoryError>;
     async fn reset_stale(&self) -> Result<i32, RepositoryError>;
     async fn count_active_by_type(&self, metadata_type: &str) -> Result<i64, RepositoryError>;
+    async fn create(&self, task: &Task) -> Result<Task, RepositoryError>;
     async fn bulk_create(&self, tasks: &[Task]) -> Result<(), RepositoryError>;
 }
 
-/// Single-task creation inside a TxScope (see ports/unit_of_work.rs).
+// Tx-scoped mutations live in crates/domain/src/ports/transaction.rs
+
+/// Single-task creation inside an open transaction, used when the
+/// schedule must be atomic with a business mutation.
 pub trait TaskMutations: Send {
     async fn create(&mut self, task: &Task) -> Result<Task, RepositoryError>;
 }
@@ -217,20 +219,36 @@ pub trait TaskConsumer: Send + Sync {
 
 ### TaskScheduler (stateless domain utility)
 
-Single entry point for creating tasks. Use cases call this inside a `TxScope`
-opened via `UnitOfWork::begin` — never call `TaskMutations::create` directly.
+Single entry point for creating tasks. Use cases never call
+`TaskMutations::create` or `TaskRepository::create` directly — they go
+through one of the scheduler methods so the task construction logic
+(metadata serialization, timestamps, defaults) lives in exactly one place.
 
 ```rust
 // In crates/domain/src/task/scheduler.rs
 impl TaskScheduler {
-    pub async fn schedule<M: TaskMetadata>(
+    /// Build a PENDING Task row without inserting it. Single source of
+    /// truth for Task construction; bulk callers use this directly.
+    pub fn build_pending_task<M: TaskMetadata>(
+        metadata: &M,
+        run_at: Option<DateTime<Utc>>,
+    ) -> Result<Task, RepositoryError> { /* ... */ }
+
+    /// Schedule inside an open transaction — use when the task must
+    /// commit atomically with a business mutation.
+    pub async fn schedule_in_tx<M: TaskMetadata>(
         tasks: &mut dyn TaskMutations,
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
-    ) -> Result<Task, RepositoryError> {
-        // Construct a Task with PENDING status and insert via tasks.create.
-        // No deduplication — handlers must be idempotent.
-    }
+    ) -> Result<Task, RepositoryError> { /* ... */ }
+
+    /// Schedule standalone — use when there's no business mutation to
+    /// bundle with (system tasks, fire-and-forget schedules).
+    pub async fn schedule_standalone<M: TaskMetadata>(
+        repo: &dyn TaskRepository,
+        metadata: &M,
+        run_at: Option<DateTime<Utc>>,
+    ) -> Result<Task, RepositoryError> { /* ... */ }
 }
 ```
 
@@ -390,8 +408,9 @@ with longer-running handlers would require revisiting the threshold
 
 Runs periodically. For each registered system task metadata, checks if an
 active (PENDING or IN_PROGRESS) task exists via `count_active_by_type`. If
-not, schedules one via `TaskScheduler::schedule` inside a `uow.begin` tx.
-Uses distributed lock. Observes shutdown signal.
+not, schedules one via `TaskScheduler::schedule_standalone` — no business
+mutation to bundle with, so no transaction is needed. Uses distributed
+lock. Observes shutdown signal.
 
 Note that a working recurring task normally reschedules *itself* on success
 via `compute_update` (which reads `execution_interval_ms` from the row). The

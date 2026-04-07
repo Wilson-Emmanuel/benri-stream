@@ -5,7 +5,6 @@ use tokio::sync::watch;
 
 use domain::ports::distributed_lock::DistributedLockPort;
 use domain::ports::task::TaskRepository;
-use domain::ports::unit_of_work::UnitOfWork;
 use domain::task::metadata::cleanup_stale_videos::CleanupStaleVideosTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
 
@@ -23,17 +22,15 @@ const LOCK_TTL_SECS: u64 = 60;
 /// dead-lettered instance.
 pub struct SystemTaskChecker {
     task_repo: Arc<dyn TaskRepository>,
-    uow: Arc<dyn UnitOfWork>,
     lock: Arc<dyn DistributedLockPort>,
 }
 
 impl SystemTaskChecker {
     pub fn new(
         task_repo: Arc<dyn TaskRepository>,
-        uow: Arc<dyn UnitOfWork>,
         lock: Arc<dyn DistributedLockPort>,
     ) -> Self {
-        Self { task_repo, uow, lock }
+        Self { task_repo, lock }
     }
 
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
@@ -99,11 +96,11 @@ impl SystemTaskChecker {
 
         tracing::info!(metadata_type, "creating missing system task");
         let metadata = make_metadata();
-        let mut tx = self.uow.begin().await.map_err(|e| e.to_string())?;
-        TaskScheduler::schedule(tx.tasks(), &metadata, None)
+        // Single-statement insert — no business mutation to bundle with,
+        // so no transaction is needed.
+        TaskScheduler::schedule_standalone(self.task_repo.as_ref(), &metadata, None)
             .await
             .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 }

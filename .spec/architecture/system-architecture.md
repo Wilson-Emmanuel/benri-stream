@@ -131,14 +131,30 @@ wire implementations to traits at startup.
 
 ## Transaction Management
 
-Currently most operations are single-query or read-only.
-The worker's `ProcessVideoUseCase` does multiple status updates but they're sequential
-and idempotent — if the worker crashes, it picks up where it left off on restart.
+Most operations are single-statement writes or reads. These go through
+pool-backed repository methods (e.g. `VideoRepository::update_status_if`,
+`TaskRepository::create`) and inherit atomicity from Postgres itself —
+one SQL statement, one implicit commit, no ceremony.
 
-If transaction boundaries become necessary (e.g., multi-table writes that must be atomic),
-the domain defines a `UnitOfWork` trait, infrastructure provides a Postgres implementation
-using sqlx transactions, and use cases call `uow.begin()` / `uow.commit()`. The
-application layer never sees sqlx types.
+Multi-statement atomicity is handled by a domain port, `TransactionPort`,
+with a closure-based API:
+
+```rust
+tx_port.run(Box::new(|scope| Box::pin(async move {
+    scope.videos().update_status_if(&id, from, to).await?;
+    TaskScheduler::schedule_in_tx(scope.tasks(), &metadata, None).await?;
+    Ok(())
+}))).await?;
+```
+
+The infrastructure impl opens a sqlx transaction, runs the closure, and
+commits on `Ok` / rolls back on `Err` or panic. Use cases never see
+sqlx types.
+
+The `TxScope` passed into the closure exposes only the mutation traits
+that actually need transactional bundling (`VideoMutations`,
+`TaskMutations`). Single-op writes stay on the pool-backed repositories
+where the ceremony would be pure overhead.
 
 ---
 

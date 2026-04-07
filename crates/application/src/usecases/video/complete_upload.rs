@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use domain::ports::storage::{StorageError, StoragePort};
-use domain::ports::unit_of_work::UnitOfWork;
-use domain::ports::video::{RepositoryError, VideoRepository};
+use domain::ports::task::TaskRepository;
+use domain::ports::transaction::TransactionPort;
+use domain::ports::video::VideoRepository;
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
 use domain::task::metadata::process_video::ProcessVideoTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
@@ -14,17 +16,19 @@ const FILE_SIGNATURE_READ_BYTES: u64 = 16;
 
 pub struct CompleteUploadUseCase {
     video_repo: Arc<dyn VideoRepository>,
-    uow: Arc<dyn UnitOfWork>,
+    task_repo: Arc<dyn TaskRepository>,
+    tx: Arc<dyn TransactionPort>,
     storage: Arc<dyn StoragePort>,
 }
 
 impl CompleteUploadUseCase {
     pub fn new(
         video_repo: Arc<dyn VideoRepository>,
-        uow: Arc<dyn UnitOfWork>,
+        task_repo: Arc<dyn TaskRepository>,
+        tx: Arc<dyn TransactionPort>,
         storage: Arc<dyn StoragePort>,
     ) -> Self {
-        Self { video_repo, uow, storage }
+        Self { video_repo, task_repo, tx, storage }
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
@@ -52,11 +56,17 @@ impl CompleteUploadUseCase {
             .ok_or(Error::FileNotFoundInStorage)?;
 
         if metadata.size_bytes > MAX_UPLOAD_SIZE_BYTES {
-            // Schedule immediate deletion. The video row stays in
-            // PENDING_UPLOAD until the DeleteVideo task runs. If the
-            // schedule itself fails, the safety-net sweep (UC-VID-006)
-            // picks it up within 24h — log and still return the user error.
-            if let Err(e) = schedule_delete(&self.uow, &video.id).await {
+            // Schedule immediate deletion. Single-statement task insert,
+            // no transaction needed. If the schedule itself fails, the
+            // safety-net sweep (UC-VID-006) picks it up within 24h — log
+            // and still return the user error.
+            if let Err(e) = TaskScheduler::schedule_standalone(
+                self.task_repo.as_ref(),
+                &DeleteVideoTaskMetadata { video_id: video.id.clone() },
+                None,
+            )
+            .await
+            {
                 tracing::warn!(
                     video_id = %video.id,
                     error = %e,
@@ -76,7 +86,13 @@ impl CompleteUploadUseCase {
             })?;
 
         if !video.format.validate_signature(&header_bytes) {
-            if let Err(e) = schedule_delete(&self.uow, &video.id).await {
+            if let Err(e) = TaskScheduler::schedule_standalone(
+                self.task_repo.as_ref(),
+                &DeleteVideoTaskMetadata { video_id: video.id.clone() },
+                None,
+            )
+            .await
+            {
                 tracing::warn!(
                     video_id = %video.id,
                     error = %e,
@@ -86,63 +102,54 @@ impl CompleteUploadUseCase {
             return Err(Error::InvalidFileSignature);
         }
 
-        // Success path: atomic status update + ProcessVideo scheduling in one tx.
-        // Per rule #8, the task must be scheduled in the same transaction as the
-        // triggering business mutation. If the status update races another worker
-        // (status no longer PENDING_UPLOAD), we roll back the whole tx — no stale
-        // schedule.
-        let mut tx = self
-            .uow
-            .begin()
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        let updated = tx
-            .videos()
-            .update_status_if(&video.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
+        // Success path: atomic status update + ProcessVideo scheduling in
+        // one tx. The task must be scheduled in the same transaction as
+        // the triggering business mutation — if the status update races
+        // another worker (status no longer PENDING_UPLOAD), the whole tx
+        // rolls back and no stale task is left behind.
+        //
+        // `claimed` is an owned `Arc<AtomicBool>` so the closure can be
+        // `'static` while still letting us read the result after the tx
+        // commits.
+        let claimed = Arc::new(AtomicBool::new(false));
+        let claimed_w = claimed.clone();
+        let id_for_tx = video.id.clone();
+
+        self.tx
+            .run(Box::new(move |scope| {
+                Box::pin(async move {
+                    let ok = scope
+                        .videos()
+                        .update_status_if(&id_for_tx, VideoStatus::PendingUpload, VideoStatus::Uploaded)
+                        .await?;
+                    claimed_w.store(ok, Ordering::Relaxed);
+                    if !ok {
+                        // Return Ok — the tx commits with no changes.
+                        // The caller sees `claimed == false` and returns
+                        // AlreadyCompleted without scheduling the task.
+                        return Ok(());
+                    }
+                    TaskScheduler::schedule_in_tx(
+                        scope.tasks(),
+                        &ProcessVideoTaskMetadata { video_id: id_for_tx.clone() },
+                        None,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }))
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        if !updated {
-            // Don't commit — nothing changed. The dropped tx rolls back cleanly.
+        if !claimed.load(Ordering::Relaxed) {
             return Err(Error::AlreadyCompleted);
         }
-
-        TaskScheduler::schedule(
-            tx.tasks(),
-            &ProcessVideoTaskMetadata { video_id: video.id.clone() },
-            None,
-        )
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
 
         Ok(Output {
             id: video.id,
             status: VideoStatus::Uploaded,
         })
     }
-}
-
-/// Opens a one-shot tx and schedules a `DeleteVideo` task for the given
-/// video. Multiple schedules for the same video are safe — the handler
-/// is idempotent and a second-runner sees `VideoNotFound` after the first
-/// completes.
-async fn schedule_delete(
-    uow: &Arc<dyn UnitOfWork>,
-    video_id: &VideoId,
-) -> Result<(), RepositoryError> {
-    let mut tx = uow.begin().await?;
-    TaskScheduler::schedule(
-        tx.tasks(),
-        &DeleteVideoTaskMetadata { video_id: video_id.clone() },
-        None,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
 }
 
 pub struct Input {

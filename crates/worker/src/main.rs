@@ -20,7 +20,7 @@ use domain::task::metadata::cleanup_stale_videos::CleanupStaleVideosTaskMetadata
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
 use domain::task::metadata::process_video::ProcessVideoTaskMetadata;
 use infrastructure::config::AppConfig;
-use infrastructure::postgres::unit_of_work::PgUnitOfWork;
+use infrastructure::postgres::transaction::PgTransactionPort;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
 use infrastructure::postgres::task_repository::PostgresTaskRepository;
 use infrastructure::storage::s3_client::S3StorageClient;
@@ -74,13 +74,13 @@ async fn main() {
     let redis_client =
         redis::Client::open(config.redis_url.as_str()).expect("Invalid Redis URL");
 
-    // Repositories + UnitOfWork
+    // Repositories + TransactionPort
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =
         Arc::new(PostgresVideoRepository::new(pool.clone()));
     let task_repo: Arc<dyn domain::ports::task::TaskRepository> =
         Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let uow: Arc<dyn domain::ports::unit_of_work::UnitOfWork> =
-        Arc::new(PgUnitOfWork::new(pool));
+    let tx_port: Arc<dyn domain::ports::transaction::TransactionPort> =
+        Arc::new(PgTransactionPort::new(pool));
 
     // Transcoder
     let transcoder: Arc<dyn domain::ports::transcoder::TranscoderPort> =
@@ -88,13 +88,13 @@ async fn main() {
 
     // Use cases
     let process_video_uc = Arc::new(ProcessVideoUseCase::new(
-        video_repo.clone(), uow.clone(), storage.clone(), transcoder,
+        video_repo.clone(), tx_port.clone(), storage.clone(), transcoder,
     ));
     let cleanup_uc = Arc::new(CleanupStaleVideosUseCase::new(
         video_repo.clone(), task_repo.clone(),
     ));
     let delete_video_uc = Arc::new(DeleteVideoUseCase::new(
-        video_repo.clone(), uow.clone(), storage.clone(),
+        video_repo.clone(), storage.clone(),
     ));
 
     // Handler dispatch map — one entry per task type. The adapter
@@ -140,7 +140,7 @@ async fn main() {
         task_repo.clone(), lock.clone(),
     );
     let system_checker = system_checker::SystemTaskChecker::new(
-        task_repo, uow, lock,
+        task_repo, lock,
     );
 
     // Shutdown signal — all long-running components observe this and drain

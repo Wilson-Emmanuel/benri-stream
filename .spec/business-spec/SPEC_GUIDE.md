@@ -508,9 +508,12 @@ which produce `Skip`, which produce `RetryableFailure`, which produce
    as the dispatch key.
 6. **If the task is `is_system_task = true`**, register the metadata in
    the system task checker's list (`crates/worker/src/system_checker.rs`).
-7. **If the task is scheduled by a use case**, the use case calls
-   `TaskScheduler::schedule(tx.tasks(), &metadata, trace_id, run_at)`
-   inside its `uow.begin` transaction (project rule #8).
+7. **If the task is scheduled by a use case**, the use case calls either
+   `TaskScheduler::schedule_in_tx(scope.tasks(), &metadata, run_at)` inside
+   a `TransactionPort::run` closure (when the schedule must be atomic with
+   a business mutation), or `TaskScheduler::schedule_standalone(&*task_repo,
+   &metadata, run_at)` on a pool-backed repo (when there's no business
+   mutation to bundle with).
 8. **Update the catalog's changelog** with the new entry.
 
 ### Workflow: changing a task's scheduling config

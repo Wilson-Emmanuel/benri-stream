@@ -230,6 +230,48 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(row.0)
     }
 
+    async fn create(&self, task: &Task) -> Result<Task, RepositoryError> {
+        tracing::info!(
+            task_id = %task.id,
+            metadata_type = %task.metadata_type,
+            ordering_key = ?task.ordering_key,
+            "db: creating task",
+        );
+        let metadata_str = serde_json::to_string(&task.metadata)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO tasks (
+                id, metadata_type, metadata, status, ordering_key, trace_id,
+                attempt_count, next_run_at, error, started_at, completed_at,
+                created_at, updated_at
+             )
+             VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13
+             )",
+        )
+        .bind(task.id.0)
+        .bind(&task.metadata_type)
+        .bind(&metadata_str)
+        .bind(task.status.as_str())
+        .bind(&task.ordering_key)
+        .bind(&task.trace_id)
+        .bind(task.attempt_count)
+        .bind(task.next_run_at)
+        .bind(&task.error)
+        .bind(task.started_at)
+        .bind(task.completed_at)
+        .bind(task.created_at)
+        .bind(task.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        Ok(task.clone())
+    }
+
     /// Bulk-insert N tasks in a single statement using `INSERT ... SELECT
     /// FROM UNNEST(...)`. One round trip, atomic at the statement level.
     async fn bulk_create(&self, tasks: &[Task]) -> Result<(), RepositoryError> {

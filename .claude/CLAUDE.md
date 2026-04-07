@@ -55,8 +55,11 @@ For full architecture details, see the relevant `architecture/backend/` doc.
 5. **All repository and port methods are `async`**.
 6. **Transactions are owned by use cases** -- never by infrastructure or presentation.
 7. **Error types are defined per use case**, not per entity.
-8. **Tasks are created via `TaskScheduler`** within the same DB transaction as the
-   triggering operation. See `backend/task-system.md`.
+8. **Tasks are created via `TaskScheduler`** — either `schedule_in_tx`
+   inside a `TransactionPort::run` closure (when the schedule must be
+   atomic with a business mutation) or `schedule_standalone` on a
+   pool-backed repo (when there's no business mutation to bundle with).
+   See `backend/task-system.md`.
 
 ---
 

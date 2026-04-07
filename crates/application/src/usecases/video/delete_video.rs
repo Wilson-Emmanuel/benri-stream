@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use domain::ports::storage::StoragePort;
-use domain::ports::unit_of_work::UnitOfWork;
 use domain::ports::video::VideoRepository;
 use domain::video::VideoId;
 
@@ -18,17 +17,12 @@ use domain::video::VideoId;
 /// "already deleted" outcomes, so retries are safe.
 pub struct DeleteVideoUseCase {
     video_repo: Arc<dyn VideoRepository>,
-    uow: Arc<dyn UnitOfWork>,
     storage: Arc<dyn StoragePort>,
 }
 
 impl DeleteVideoUseCase {
-    pub fn new(
-        video_repo: Arc<dyn VideoRepository>,
-        uow: Arc<dyn UnitOfWork>,
-        storage: Arc<dyn StoragePort>,
-    ) -> Self {
-        Self { video_repo, uow, storage }
+    pub fn new(video_repo: Arc<dyn VideoRepository>, storage: Arc<dyn StoragePort>) -> Self {
+        Self { video_repo, storage }
     }
 
     pub async fn execute(&self, input: Input) -> Result<(), Error> {
@@ -59,17 +53,9 @@ impl DeleteVideoUseCase {
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // 3. Delete the database row.
-        let mut tx = self
-            .uow
-            .begin()
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        tx.videos()
+        // 3. Delete the database row — single statement, no transaction needed.
+        self.video_repo
             .delete(&video.id)
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        tx.commit()
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 

@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use domain::ports::storage::StoragePort;
-use domain::ports::unit_of_work::UnitOfWork;
+use domain::ports::video::VideoRepository;
 use domain::video::{
     Video, VideoFormat, VideoId, VideoStatus, MAX_TITLE_LENGTH, MAX_UPLOAD_SIZE_BYTES,
 };
 
 pub struct InitiateUploadUseCase {
-    uow: Arc<dyn UnitOfWork>,
+    video_repo: Arc<dyn VideoRepository>,
     storage: Arc<dyn StoragePort>,
 }
 
 impl InitiateUploadUseCase {
-    pub fn new(uow: Arc<dyn UnitOfWork>, storage: Arc<dyn StoragePort>) -> Self {
-        Self { uow, storage }
+    pub fn new(video_repo: Arc<dyn VideoRepository>, storage: Arc<dyn StoragePort>) -> Self {
+        Self { video_repo, storage }
     }
 
     pub async fn execute(&self, input: Input) -> Result<Output, Error> {
@@ -48,16 +48,9 @@ impl InitiateUploadUseCase {
             created_at: Utc::now(),
         };
 
-        let mut tx = self
-            .uow
-            .begin()
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        tx.videos()
+        // Single-statement insert — no transaction needed.
+        self.video_repo
             .insert(&video)
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))?;
-        tx.commit()
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
