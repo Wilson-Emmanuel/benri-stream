@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use domain::ports::storage::StoragePort;
@@ -53,6 +53,7 @@ impl GstreamerTranscoder {
         level: &QualityLevel,
     ) -> Result<u32, TranscoderError> {
         use gstreamer as gst;
+        use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
 
         let pipeline = gst::Pipeline::new();
@@ -185,6 +186,7 @@ impl TranscoderPort for GstreamerTranscoder {
     async fn probe(&self, storage_key: &str) -> Result<ProbeResult, TranscoderError> {
         use gstreamer as gst;
         use gstreamer_pbutils as gst_pbutils;
+        use gstreamer_pbutils::prelude::*;
 
         tracing::info!(storage_key, "transcoder: probing video file");
 
@@ -254,7 +256,10 @@ impl TranscoderPort for GstreamerTranscoder {
 
         let quality_levels = QualityLevel::all().to_vec();
         let mut total_segments: u32 = 0;
-        let mut first_segment_notified = false;
+        // Wrap the FnOnce callback in Option so we can `take()` it on first
+        // call. The compiler can't statically prove the loop body calls it
+        // at most once, so a bare FnOnce would be a use-after-move error.
+        let mut on_first_segment: Option<Box<dyn FnOnce() + Send>> = Some(on_first_segment);
 
         // Process each quality level. The GStreamer pipeline runs synchronously
         // (blocking on the bus), so we run each in spawn_blocking.
@@ -295,10 +300,10 @@ impl TranscoderPort for GstreamerTranscoder {
 
                 total_segments += segment_count;
 
-                // Notify on first successful segment
-                if !first_segment_notified {
-                    first_segment_notified = true;
-                    on_first_segment();
+                // Notify on first successful segment. `take()` ensures the
+                // callback is called at most once across all iterations.
+                if let Some(cb) = on_first_segment.take() {
+                    cb();
                 }
             }
         }
