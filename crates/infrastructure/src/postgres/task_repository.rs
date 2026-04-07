@@ -71,6 +71,16 @@ impl TaskRepository for PostgresTaskRepository {
         limit: i32,
         before: DateTime<Utc>,
     ) -> Result<Vec<Task>, RepositoryError> {
+        // SQL structure:
+        //   blocked_keys → ordering keys with an IN_PROGRESS task (cannot start another)
+        //   eligible     → PENDING tasks not blocked by an in-progress sibling
+        //   keyed_dedup  → for keyed eligible tasks, pick the oldest per ordering_key.
+        //                  DISTINCT ON requires its own ORDER BY, so it lives in its
+        //                  own CTE — Postgres rejects ORDER BY directly before UNION
+        //                  without parenthesizing each branch, and a separate CTE
+        //                  is cleaner than nested parens.
+        //   selected     → keyed_dedup ∪ unkeyed eligible
+        //   final SELECT → join back to tasks for the full row, order, and limit
         sqlx::query(
             r#"
             WITH blocked_keys AS (
@@ -90,22 +100,22 @@ impl TaskRepository for PostgresTaskRepository {
                       )
                   )
             ),
+            keyed_dedup AS (
+                SELECT DISTINCT ON (ordering_key) id, next_run_at
+                FROM eligible
+                WHERE ordering_key IS NOT NULL
+                ORDER BY ordering_key, next_run_at ASC, id ASC
+            ),
             selected AS (
-                SELECT id, next_run_at FROM (
-                    SELECT DISTINCT ON (ordering_key) id, next_run_at
-                    FROM eligible
-                    WHERE ordering_key IS NOT NULL
-                    ORDER BY ordering_key, next_run_at ASC, id ASC
-                    UNION ALL
-                    SELECT id, next_run_at FROM eligible WHERE ordering_key IS NULL
-                ) combined
-                ORDER BY next_run_at ASC, id ASC
-                LIMIT $2
+                SELECT id, next_run_at FROM keyed_dedup
+                UNION ALL
+                SELECT id, next_run_at FROM eligible WHERE ordering_key IS NULL
             )
             SELECT t.*
             FROM tasks t
             JOIN selected s ON s.id = t.id
             ORDER BY s.next_run_at ASC, s.id ASC
+            LIMIT $2
             "#,
         )
         .bind(before)
