@@ -11,8 +11,17 @@ uploaded to object storage as they complete, and deleted. Nothing persists betwe
 1. **Probe** — reads file headers from storage to confirm it's a valid, processable video
 2. **Transcode** — decodes the input and encodes at three quality levels simultaneously,
    producing HLS segments and playlists
-3. **Output** — writes segments and master manifest directly to object storage as they're
-   produced. Video becomes streamable progressively.
+3. **Progressive output** — a background uploader task, running concurrently with the
+   GStreamer pipeline, uploads segments and variant playlists to object storage as
+   hlssink2 produces them (not in a single batch at the end). Video becomes streamable
+   before the full transcode finishes.
+4. **First-segment trigger** — the moment the low tier's first segment is durably
+   uploaded, the uploader also generates `master.m3u8` (content is deterministic from
+   the quality ladder and the probe's `has_audio` flag, so no coordination with the
+   encoder is needed), force-uploads the current `low/playlist.m3u8` alongside it,
+   and fires a one-shot `FirstSegmentNotifier`. The application layer uses that
+   notification to write the share token to the video row (see
+   [video.md#uc-vid-005](../../business-spec/video/video.md#uc-vid-005)).
 
 ---
 
@@ -58,8 +67,13 @@ uridecodebin3 ─┬─ videoconvert → video_tee ─┬─ queue → scale(360
 - **`hlssink3`** (one per level) — writes .ts segments and per-level `playlist.m3u8`
   to a local temp dir
 
-Segments are uploaded to object storage as the pipeline produces them, then the
-master `master.m3u8` is generated from the quality level metadata and uploaded.
+Segments and variant playlists are uploaded to object storage as the pipeline
+produces them, by a separate tokio task (`HlsUploader`) that polls the
+per-tier output directories every 500 ms. The master playlist is generated
+and uploaded the moment the low tier's first segment becomes durable — not
+at the end of the pipeline — and that same moment fires the one-shot
+first-segment notifier the application layer uses to publish the share
+link. See `crates/infrastructure/src/transcoder/hls_uploader.rs`.
 
 **Audio handling**: a quick `Discoverer` call before building the pipeline tells us
 whether the source has an audio stream. If yes, we build the audio branch and wire it
@@ -89,16 +103,34 @@ pub trait TranscoderPort: Send + Sync {
         input_key: &str,
         output_prefix: &str,
         probe: &ProbeResult,
+        first_segment_ready: Box<dyn FirstSegmentNotifier>,
     ) -> Result<(), TranscoderError>;
+}
+
+pub trait FirstSegmentNotifier: Send + Sync {
+    fn notify(self: Box<Self>);
 }
 ```
 
 `probe()` validates the file is decodable AND captures stream-level details
 (`has_audio`, dimensions, codec) so `transcode_to_hls` doesn't have to re-read
-headers from S3. The trait knows nothing about how transcoding happens —
-quality levels, codecs, and segment config are internal to the infrastructure
-implementation. Transcode either runs to completion or fails wholesale; there
-is no partial-success path.
+headers from S3.
+
+`transcode_to_hls` takes a `FirstSegmentNotifier` the application layer
+constructs (typically wrapping a `tokio::sync::oneshot::Sender`). The
+transcoder fires it exactly once, the moment the master playlist and the
+low tier's first segment are both durable in storage — this is the
+earliest point at which a viewer holding a share link could begin playback.
+If the transcoder errors before that moment, the notifier is dropped
+without being called; the caller treats "notifier never fired" as a normal
+failure outcome.
+
+The trait knows nothing about how transcoding happens — quality levels,
+codecs, and segment config are internal to the infrastructure
+implementation. Transcode either runs to completion or fails wholesale;
+there is no partial-success preservation path (failures still mark the
+video `FAILED` and schedule `DeleteVideo` regardless of how much output
+made it to storage).
 
 **Implementation** (infrastructure):
 ```rust

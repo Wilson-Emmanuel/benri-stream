@@ -16,6 +16,7 @@ See use cases below for details on each step.
 | 2026-04-03 | Initial spec | Wilson |
 | 2026-04-06 | Split deletion into UC-VID-007 (`DeleteVideo` task). UC-VID-002 and UC-VID-005 schedule it directly on rejection/failure paths. UC-VID-006 becomes a safety-net sweep that schedules instead of mutating. FAILED retention reduced from 30 days to 24 hours. | Wilson |
 | 2026-04-07 | Drop `PARTIAL` and `INCOMPLETE` from the lifecycle. Share token is now generated only when transcoding completes successfully (`Processing → Processed`). Probe + the upload-time validations are sufficient evidence the file is good; the previous "first segment" early-stream mechanism added significant complexity (callback plumbing, segment counting, branching error handling) without delivering the promised early time-to-stream — the implementation always ran the pipeline to completion before doing anything. Transcode failures now mark the whole video failed and schedule deletion; we no longer try to preserve partial output. | Wilson |
+| 2026-04-09 | Early share-link publishing: share token is now written during `Processing` the moment the low tier's first HLS segment + `master.m3u8` land in storage, rather than at the end of the full transcode. Video status stays at `Processing` until all tiers finish — only the token moves earlier. This reintroduces the "early time-to-stream" goal that the 2026-04-07 change removed, but without the `PARTIAL` / `INCOMPLETE` state machine that made the previous attempt complex. The trigger is a single one-shot event fired by the transcoder when the first segment and master playlist are both durable; no segment counting, no branching state. If the transcode fails later (after the token was issued) we still go straight to `FAILED` + `DeleteVideo`; viewers holding the link see `VIDEO_NOT_FOUND` once delete runs. Accepted race, see UC-VID-005. | Wilson |
 
 ---
 
@@ -26,7 +27,7 @@ See use cases below for details on each step.
 | Attribute | Type | Nullable | Description |
 |-----------|------|----------|-------------|
 | `id` | Unique identifier | No | Internal system identifier |
-| `share_token` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until processing completes successfully. URL-safe |
+| `share_token` | Text (21 chars) | Yes | Unique, unguessable token for the shareable link. Null until the low tier's first HLS segment and the master playlist are both in storage (written during `Processing`, before the full transcode finishes). URL-safe |
 | `title` | Text (1–100 chars) | No | User-provided title, displayed on the player page. Frontend pre-fills from filename |
 | `format` | Video Format (see Enums) | No | Determined from MIME type on upload, validated via file signature on complete |
 | `status` | Video Status (see Enums) | No | Current lifecycle state |
@@ -42,7 +43,7 @@ See use cases below for details on each step.
 | `PENDING_UPLOAD` | Presigned URL issued, waiting for client to upload to storage |
 | `UPLOADED` | File in storage, queued for processing |
 | `PROCESSING` | Being converted into streaming format |
-| `PROCESSED` | Fully processed and watchable. Share token has been generated |
+| `PROCESSED` | Fully processed. All quality tiers finished encoding and every segment is in storage. Note: a video can be watchable *before* reaching this state — the share token and master playlist are published earlier, as soon as the low tier's first segment lands (see UC-VID-005). `PROCESSED` specifically means "nothing more will be written" |
 | `FAILED` | Processing failed at any point. No shareable link generated; video is scheduled for deletion |
 
 #### Video Format
@@ -245,8 +246,11 @@ Fetches video metadata and streaming info for the player page.
 [UC-VID-002](#uc-vid-002) on successful upload completion.
 
 Probes the file, transcodes it into adaptive HLS, and uploads the segments.
-On success, the share token is generated and the status flips to `PROCESSED`
-in a single atomic update.
+Segments are uploaded to storage progressively while the pipeline is still
+running. The share token is written to the video row as soon as the low
+tier's first segment and the master playlist are both in storage — the
+viewer's share link becomes valid well before the full transcode finishes.
+Once every tier has finished, the status flips to `PROCESSED`.
 
 **Input**
 
@@ -260,25 +264,50 @@ in a single atomic update.
 
 **Mutations**
 1. Atomically set `status = PROCESSING` (only if still `UPLOADED`). If not, skip — another worker claimed it.
-2. Probe the file — confirm it's a valid, decodable video and capture stream info
-3. Transcode the full video into adaptive HLS, uploading segments to storage
-4. On success → atomically set `share_token` and `status = PROCESSED` in one statement
-5. Delete original upload from storage. Best-effort — a failure here leaves
+2. Probe the file — confirm it's a valid, decodable video and capture stream info.
+3. Start the transcode pipeline. Segments and per-tier playlists are uploaded to
+   storage progressively as the pipeline produces them (not in a single batch
+   at the end).
+4. **Early share-link publish**: the first moment the low tier's first segment
+   and the master playlist are both durable in storage, atomically write
+   `share_token` to the video row (only if status is still `Processing`). This
+   flips the share link to live while the rest of the transcode continues in
+   the background. Viewers who open the link before all tiers finish get a
+   playable low-quality stream that fills in with higher tiers as they land.
+5. Wait for the pipeline to finish all tiers.
+6. On success → atomically set `status = PROCESSED` (share token is already
+   written; this step is purely the status flip). Step 4's write and this
+   step's write are both guarded on the row still being in `Processing`, so
+   a failure path that flipped the status in between (rare) cleanly wins.
+7. Delete original upload from storage. Best-effort — a failure here leaves
    an orphan that the cleanup safety-net (UC-VID-006) collects.
 
 On probe failure or transcode failure:
 - Atomically set `status = FAILED` and schedule a `DeleteVideo` task
   ([UC-VID-007](#uc-vid-007)) in the same DB transaction. The task removes
-  the original upload and the video record.
-- No share token generated — uploader sees FAILED when polling.
+  the original upload, any partial output in storage, and the video record.
+- If the failure happens **before** step 4 (no share token issued yet), the
+  uploader sees `FAILED` when polling — same behavior as before this change.
+- If the failure happens **after** step 4 (share token already issued), the
+  viewer holding the link briefly sees a playable stream that stops advancing,
+  then `VIDEO_NOT_FOUND` once `DeleteVideo` runs. The share token is *not*
+  "revoked" in any nuanced way — deletion removes the row and everyone's link
+  stops working the same way. Accepted tradeoff: the race window is minutes at
+  most, and the product is anonymous casual sharing where a short-lived broken
+  link is less bad than waiting minutes longer for *every* link to appear.
 
-**Why no early-stream / partial-success handling**: probe + the upload-time
-validations (client-side type/size check, server-side magic-byte signature
-check) provide strong evidence the file is good before we start transcoding.
-A previous design attempted to expose the video as soon as the first segment
-was produced (a `PARTIAL` state) and to preserve partial output on mid-pipeline
-failures (an `INCOMPLETE` state); both added significant complexity without
-real benefit and were dropped on 2026-04-07.
+**Why early publish is minimal, not a return to `PARTIAL`**: the 2026-04-07
+change removed a previous "first segment" mechanism that introduced
+`PARTIAL` and `INCOMPLETE` states in the enum, segment-counting callbacks,
+and branching failure paths that tried to preserve half-finished output.
+This change reintroduces the time-to-stream goal without any of that: the
+enum is unchanged (`PROCESSING` still means "work in progress" and is also
+now the state in which a video can already be watched via its share link),
+there is no partial-preservation story on failure (we still delete everything
+the same way), and the trigger is a single one-shot event from the transcoder
+rather than a state machine the use case has to track. The entire surface
+of the change is one extra atomic write during `Processing` and one earlier
+moment at which the share link becomes visible to pollers.
 
 **Output**: N/A (system process)
 
@@ -289,8 +318,14 @@ real benefit and were dropped on 2026-04-07.
 - On probe or transcode failure: schedules `DeleteVideo`
   ([UC-VID-007](#uc-vid-007)) in the same transaction as the `FAILED` status update.
 
-**Idempotency**: Idempotent — re-running on `PROCESSED` is a no-op (the
-initial `update_status_if(Uploaded → Processing)` returns false).
+**Idempotency**: Not safely retryable. Re-running after a successful first
+attempt is a no-op (the initial `update_status_if(Uploaded → Processing)`
+returns false). Re-running after a *failed* attempt is also a no-op for the
+same reason — the row is already in `Processing` or `Failed`. The task is
+configured with `max_retries = 1` so the task system does not retry; any
+failure is terminal and the safety-net sweep ([UC-VID-006](#uc-vid-006))
+collects the row 24 hours later. See
+[task-catalog.md#processvideo](../task-system/task-catalog.md#processvideo).
 
 ---
 

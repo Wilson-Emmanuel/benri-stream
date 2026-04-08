@@ -1,5 +1,6 @@
 <script>
 	import { page } from '$app/stores';
+	import { get } from 'svelte/store';
 	import { onMount } from 'svelte';
 	import { getVideoByToken } from '$lib/api.js';
 
@@ -7,7 +8,12 @@
 	let error = $state(null);
 	let videoEl = $state(null);
 
-	const shareToken = $derived($page.params.shareToken);
+	// Read the route param directly from the store instead of going
+	// through `$derived($page.params.shareToken)` — inside an async
+	// `onMount` that combination can race with store population and
+	// silently swallow the rejection. `get(page)` is synchronous and
+	// always resolved by the time `onMount` runs.
+	const shareToken = get(page).params.shareToken;
 
 	onMount(async () => {
 		try {

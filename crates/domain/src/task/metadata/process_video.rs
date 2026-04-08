@@ -32,7 +32,17 @@ impl TaskMetadata for ProcessVideoTaskMetadata {
     }
 
     fn max_retries(&self) -> Option<i32> {
-        Some(5)
+        // One attempt, then dead letter. Rationale: the meaningful
+        // failure modes for this task are (a) probe failure on a
+        // corrupt source — not retryable, the file is bad — and
+        // (b) transcode failure mid-pipeline, which in practice is a
+        // worker hardware / resource problem that a retry on the same
+        // worker won't fix. Retrying also interacts badly with our
+        // claim guard: the second attempt would find the video
+        // already in `Processing` and no-op, leaving the row stuck.
+        // Cleanest to treat any failure as terminal and let the
+        // safety-net sweep collect the row.
+        Some(1)
     }
 
     fn retry_base_delay(&self) -> Duration {
@@ -40,6 +50,12 @@ impl TaskMetadata for ProcessVideoTaskMetadata {
     }
 
     fn processing_timeout(&self) -> Duration {
-        Duration::from_secs(30 * 60)
+        // Sized to comfortably fit a 1 GB upload through three CPU
+        // tiers of x264 `ultrafast` on typical dev/prod hardware,
+        // with ~2× safety margin. 30 minutes (the previous value)
+        // was tight enough that a 2 MB webm on a Docker-on-Mac test
+        // bed already came within a minute of it. Revisit once
+        // hardware encoders are in the pipeline.
+        Duration::from_secs(2 * 60 * 60)
     }
 }

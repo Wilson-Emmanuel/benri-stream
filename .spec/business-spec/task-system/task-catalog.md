@@ -13,12 +13,17 @@ runtime (entity, lifecycle, worker design), see
 |------|--------|--------|
 | 2026-04-06 | Add ProcessVideo and CleanupStaleVideos. Move workflow guidance to SPEC_GUIDE. | Wilson |
 | 2026-04-06 | Initial DeleteVideo entry | Wilson |
+| 2026-04-09 | ProcessVideo: bump `processing_timeout` 30 min → 2 h to cover 1 GB source on CPU-only worker; drop `max_retries` 5 → 1 because our failure modes (bad source, hardware exhaustion) aren't improved by retry and the use-case claim guard makes a second attempt a no-op anyway. | Wilson |
 
 ---
 
 ## ProcessVideo
 
-Transcodes an uploaded video into HLS segments.
+Transcodes an uploaded video into HLS segments. Also publishes the share
+link early — the moment the low tier's first segment and the master
+playlist are durable in storage — so viewers see a playable link well
+before the full transcode finishes. See
+[UC-VID-005](../video/video.md#uc-vid-005) for the full lifecycle.
 
 | | |
 |---|---|
@@ -26,17 +31,26 @@ Transcodes an uploaded video into HLS segments.
 | **Fields** | `video_id: VideoId` |
 | **Use case** | [UC-VID-005 Process Video](../video/video.md#uc-vid-005) |
 | **Ordering key** | `video_process:{video_id}` — dedup-by-default and sequential. Prevents two concurrent process attempts on the same video. |
-| **Max retries** | `5` |
-| **Retry base delay** | `60 seconds` |
+| **Max retries** | `1` — one attempt, then dead letter. See failure model below. |
+| **Retry base delay** | `60 seconds` — applies only to the single retry permitted by `max_retries`. |
 | **Execution interval** | N/A (one-shot) |
-| **Processing timeout** | `30 minutes` — transcoding a 1 GB video can take a while. |
+| **Processing timeout** | `2 hours` — sized to fit a 1 GB source through three CPU-only x264 `ultrafast` tiers with a ~2× safety margin. The previous 30-minute value was hit by small real-world videos on dev hardware. |
 | **System task** | `false` |
 
-**Failure model**: handler maps `VideoNotFound` → `PermanentFailure` (dead letter),
-any other error → `RetryableFailure`. The use case itself atomically transitions
-to `FAILED` and schedules a `DeleteVideo` task on probe / zero-segment failures,
-so the `RetryableFailure` path only fires on infrastructure issues (DB down,
-etc.) that should be retried.
+**Failure model**: handler maps `VideoNotFound` → `PermanentFailure` (dead
+letter), any other error → `RetryableFailure`. With `max_retries = 1` that
+retryable failure converts to dead letter after the single permitted retry.
+The use case itself atomically transitions to `FAILED` and schedules a
+`DeleteVideo` task on probe / transcode failures, so by the time the task
+system sees a `RetryableFailure` the video row has already been taken care
+of; the dead-letter entry is purely for operator visibility.
+
+**Why so few retries**: our meaningful failure modes are (a) bad source
+file (not retryable — the file won't get better), (b) worker resource
+exhaustion mid-transcode (retrying on the same worker won't fix it), and
+(c) the use case's `Uploaded → Processing` claim already ran on the first
+attempt, so a retry finds the row in `Processing` and no-ops cleanly. One
+attempt is honest about all three.
 
 ---
 

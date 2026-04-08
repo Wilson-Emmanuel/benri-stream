@@ -8,6 +8,7 @@
 | Date | Change | Author |
 |------|--------|--------|
 | 2026-04-04 | Initial spec | Wilson |
+| 2026-04-09 | UI-VID-003 now resolves in 1–2 polls once the worker publishes the share link early (as soon as the low tier's first segment lands), not at the end of the full transcode. No interaction or screen changes — just faster on the wire. | Wilson |
 
 ---
 
@@ -104,7 +105,12 @@ completes, shows processing status and eventually the shareable link.
 **Behavior**
 1. Poll `GET /api/videos/{id}/status` every 5 seconds
 2. While `shareUrl` is null and status is not `FAILED` → show "Processing..."
-3. When `shareUrl` appears → stop polling, show the link (UI-VID-004)
+3. When `shareUrl` appears → stop polling, show the link (UI-VID-004).
+   Note: thanks to the worker's early-publish behavior
+   (see [UC-VID-005](video.md#uc-vid-005)), `shareUrl` typically appears
+   well before `status` transitions to `PROCESSED` — the link is valid
+   while the full transcode is still running. From the uploader's
+   perspective this is invisible: they just see the link appear.
 4. If status is `FAILED` → stop polling, show "This video could not be processed"
 
 **States**

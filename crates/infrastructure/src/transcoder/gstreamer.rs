@@ -3,8 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use domain::ports::storage::StoragePort;
-use domain::ports::transcoder::{ProbeResult, TranscoderError, TranscoderPort};
+use domain::ports::transcoder::{
+    FirstSegmentNotifier, ProbeResult, TranscoderError, TranscoderPort,
+};
+use tokio::sync::oneshot;
 
+use super::hls_uploader::HlsUploader;
 use super::quality::QualityLevel;
 
 /// Target HLS segment duration in seconds. Shorter = faster time-to-stream,
@@ -17,8 +21,8 @@ const SEGMENT_DURATION_SECS: u32 = 4;
 const INPUT_PRESIGN_TTL_SECS: u64 = 2 * 60 * 60;
 
 /// GStreamer-based transcoder. Reads from S3 via presigned URL, writes HLS
-/// segments to a local temp dir, uploads each to S3 as it completes, then
-/// deletes the local file.
+/// segments to a local temp dir, and uploads them to S3 *while the
+/// pipeline is still running* via a concurrent [`HlsUploader`] task.
 /// Workers are stateless — nothing persists between jobs.
 pub struct GstreamerTranscoder {
     storage: Arc<dyn StoragePort>,
@@ -43,21 +47,6 @@ impl GstreamerTranscoder {
             .map_err(|e| {
                 TranscoderError::TranscodeFailed(format!("presign download url: {e}"))
             })
-    }
-
-    /// Upload a local file to storage, then delete the local copy.
-    async fn upload_and_delete(
-        storage: &dyn StoragePort,
-        local_path: &Path,
-        storage_key: &str,
-        content_type: &str,
-    ) -> Result<(), TranscoderError> {
-        storage
-            .upload_from_path(local_path, storage_key, content_type)
-            .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("upload failed: {e}")))?;
-        let _ = tokio::fs::remove_file(local_path).await;
-        Ok(())
     }
 
     /// Build and run a single HLS transcoding pipeline. The input is decoded
@@ -230,10 +219,17 @@ impl GstreamerTranscoder {
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
 
             let bitrate_kbps = level.target_bitrate_bps() / 1000;
+            // `ultrafast` is the cheapest x264 preset — trades compression
+            // efficiency for encode speed, roughly 3-5× throughput vs
+            // `fast`. For this workload (three tiers encoding in parallel
+            // on CPU, often on laptop-grade Docker hosts) wall-time is the
+            // binding constraint, and the bitrate ceilings in the quality
+            // ladder already bound the output size. Revisit if/when
+            // hardware encoders become available (vtenc / nvenc / vaapi).
             let venc = gst::ElementFactory::make("x264enc")
                 .property("bitrate", bitrate_kbps)
                 .property_from_str("tune", "zerolatency")
-                .property_from_str("speed-preset", "fast")
+                .property_from_str("speed-preset", "ultrafast")
                 .property("key-int-max", SEGMENT_DURATION_SECS * 30)
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
@@ -423,6 +419,7 @@ impl TranscoderPort for GstreamerTranscoder {
         input_key: &str,
         output_prefix: &str,
         probe: &ProbeResult,
+        first_segment_ready: Box<dyn FirstSegmentNotifier>,
     ) -> Result<(), TranscoderError> {
         use gstreamer as gst;
 
@@ -436,104 +433,75 @@ impl TranscoderPort for GstreamerTranscoder {
         gst::init().map_err(|e| TranscoderError::TranscodeFailed(format!("gst init: {e}")))?;
 
         let input_url = self.input_url(input_key).await?;
-        let storage = self.storage.clone();
-        let output_prefix = output_prefix.to_string();
-        let has_audio = probe.has_audio;
-
-        // Create temp directory for this job
         let temp_dir = tempfile::tempdir()
             .map_err(|e| TranscoderError::TranscodeFailed(format!("tempdir: {e}")))?;
         let temp_path = temp_dir.path().to_path_buf();
-
         let quality_levels = QualityLevel::all().to_vec();
 
-        // Run one GStreamer pipeline that decodes the input once and
-        // fans out to N encoder branches in parallel. GStreamer blocks
-        // on the bus, so the whole pipeline runs inside spawn_blocking.
-        {
-            let url = input_url.clone();
-            let dir = temp_path.clone();
-            let levels = quality_levels.clone();
-            tokio::task::spawn_blocking(move || {
-                Self::run_parallel_pipeline(&url, &dir, &levels, has_audio)
-            })
+        // Kick off the uploader *before* the pipeline so it catches
+        // segments from the moment they're written. It runs in its
+        // own tokio task, polling the temp dir; see
+        // `hls_uploader::HlsUploader` for the details. We signal it to
+        // stop via `stop_tx` once the pipeline has left `Playing`.
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let uploader = HlsUploader::new(
+            temp_path.clone(),
+            self.storage.clone(),
+            output_prefix.to_string(),
+            quality_levels.clone(),
+            probe.has_audio,
+            first_segment_ready,
+        );
+        let uploader_handle = tokio::spawn(uploader.run(stop_rx));
+
+        // GStreamer's bus iteration blocks the thread, so the pipeline
+        // runs inside `spawn_blocking`. Run in parallel with the
+        // uploader task above.
+        let pipeline_result =
+            Self::run_pipeline_blocking(input_url, temp_path, quality_levels, probe.has_audio)
+                .await;
+
+        // Tell the uploader the pipeline has stopped (whether success
+        // or failure) so it runs one final drain pass and exits.
+        // Ignore the send error: if the receiver is already gone, the
+        // uploader task has already returned.
+        let _ = stop_tx.send(());
+
+        // Wait for the uploader to finish its final drain before we
+        // return — otherwise the temp dir drops and we'd race the
+        // final playlist upload against the directory disappearing.
+        let uploader_result = uploader_handle
             .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("task join: {e}")))??;
-        }
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("uploader join: {e}")))?;
 
-        // Upload all per-level outputs (segments + per-level playlist).
-        // The pipeline ran to EOS without error, so each level dir has
-        // its full output.
-        for level in &quality_levels {
-            let level_dir = temp_path.join(level.name());
-            let mut entries: Vec<_> = std::fs::read_dir(&level_dir)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("readdir: {e}")))?
-                .filter_map(|e| e.ok())
-                .collect();
-            entries.sort_by_key(|e| e.file_name());
+        // Pipeline errors win: if the encode failed, surface that
+        // regardless of what the uploader saw. Only if the pipeline
+        // succeeded do we care about the uploader's outcome (it might
+        // have failed to upload the final segment, for example).
+        pipeline_result?;
+        uploader_result?;
 
-            for entry in &entries {
-                let path = entry.path();
-                let filename = path.file_name().unwrap().to_str().unwrap();
-                let s3_key = format!("{}{}/{}", output_prefix, level.name(), filename);
-                let content_type = if filename.ends_with(".m3u8") {
-                    "application/vnd.apple.mpegurl"
-                } else {
-                    "video/mp2t"
-                };
-
-                Self::upload_and_delete(storage.as_ref(), &path, &s3_key, content_type).await?;
-            }
-        }
-
-        // Generate and upload master playlist
-        let master_content = Self::generate_master_playlist(&quality_levels, has_audio);
-        let master_path = temp_path.join("master.m3u8");
-        std::fs::write(&master_path, &master_content)
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("write master: {e}")))?;
-
-        let master_key = format!("{}master.m3u8", output_prefix);
-        Self::upload_and_delete(
-            storage.as_ref(),
-            &master_path,
-            &master_key,
-            "application/vnd.apple.mpegurl",
-        )
-        .await?;
-
-        // Temp dir is cleaned up on drop
+        // Temp dir is cleaned up when `temp_dir` drops here.
         Ok(())
     }
 }
 
 impl GstreamerTranscoder {
-    /// Build the HLS master playlist.
-    ///
-    /// Includes a `CODECS=` attribute on each variant so the player can
-    /// pick a variant from the master alone (no need to fetch every
-    /// per-tier playlist first to discover codecs). The codec string is
-    /// stable across tiers because the pipeline pins H.264 to high
-    /// profile, level 4.0 — see the `h264_caps` capsfilter in
-    /// `run_parallel_pipeline`.
-    fn generate_master_playlist(levels: &[QualityLevel], has_audio: bool) -> String {
-        // avc1.640028 = High profile (64), no constraint flags (00),
-        //               level 4.0 (28 hex = 40 dec).
-        // mp4a.40.2   = AAC LC (object type 2 in MP4 audio object types).
-        let codecs = if has_audio {
-            "avc1.640028,mp4a.40.2"
-        } else {
-            "avc1.640028"
-        };
-
-        let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
-        for level in levels {
-            let (width, height) = level.resolution();
-            let bitrate = level.target_bitrate_bps();
-            m3u8.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{},CODECS=\"{}\"\n{}/playlist.m3u8\n",
-                bitrate, width, height, codecs, level.name()
-            ));
-        }
-        m3u8
+    /// Run the full GStreamer pipeline on a blocking thread. The pipeline
+    /// is constructed and driven to EOS entirely synchronously because
+    /// GStreamer's bus iteration blocks. Splitting this out of
+    /// `transcode_to_hls` keeps the async method small enough to read
+    /// at a glance.
+    async fn run_pipeline_blocking(
+        input_url: String,
+        temp_path: std::path::PathBuf,
+        quality_levels: Vec<QualityLevel>,
+        has_audio: bool,
+    ) -> Result<(), TranscoderError> {
+        tokio::task::spawn_blocking(move || {
+            Self::run_parallel_pipeline(&input_url, &temp_path, &quality_levels, has_audio)
+        })
+        .await
+        .map_err(|e| TranscoderError::TranscodeFailed(format!("pipeline task join: {e}")))?
     }
 }

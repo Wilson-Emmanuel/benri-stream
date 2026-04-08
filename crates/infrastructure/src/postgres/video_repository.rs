@@ -126,6 +126,24 @@ impl VideoRepository for PostgresVideoRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn set_share_token(
+        &self,
+        id: &VideoId,
+        share_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        tracing::info!(video_id = %id, "db: publishing share token (early)");
+        let result = sqlx::query(
+            "UPDATE videos SET share_token = $2
+             WHERE id = $1 AND status = 'PROCESSING'",
+        )
+        .bind(id.0)
+        .bind(share_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn mark_processed(
         &self,
         id: &VideoId,

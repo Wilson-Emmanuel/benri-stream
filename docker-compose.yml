@@ -86,7 +86,11 @@ services:
       # hostname the user's browser can actually reach — the internal
       # `minio` hostname above only resolves inside the docker network.
       S3_PUBLIC_ENDPOINT: http://localhost:9000
-      CDN_BASE_URL: http://localhost:8888
+      # Same-origin path: the frontend nginx proxies `/cdn/` to the
+      # cdn container, so embedding `/cdn` in stream URLs lets viewers
+      # reach HLS through whatever host they used to load the page —
+      # localhost, LAN IP, or a tunnel — without baking a hostname in.
+      CDN_BASE_URL: /cdn
       BASE_URL: http://localhost:18080
       LISTEN_ADDR: 0.0.0.0:8080
       AWS_ACCESS_KEY_ID: minioadmin
@@ -112,7 +116,9 @@ services:
       S3_OUTPUT_BUCKET: benri-stream
       S3_REGION: us-east-1
       S3_ENDPOINT: http://minio:9000
-      CDN_BASE_URL: http://localhost:8888
+      # Worker doesn't render URLs to browsers, but keep this aligned
+      # with the api so any future shared use of public_url is correct.
+      CDN_BASE_URL: /cdn
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
 

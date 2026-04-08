@@ -58,7 +58,14 @@
 	}
 
 	async function pollForShareUrl(videoId) {
-		const maxAttempts = 120; // 10 minutes at 5s intervals
+		// 10-minute safety cap. With the worker's early-publish
+		// behavior (share link appears the moment the low tier's
+		// first segment lands in storage, not when the full transcode
+		// finishes), a healthy upload resolves this loop in 1–2
+		// polls. Anything still polling after 10 minutes means the
+		// worker is genuinely stuck, and the user is better served
+		// by a clear error than an indefinite spinner.
+		const maxAttempts = 120;
 		for (let i = 0; i < maxAttempts; i++) {
 			const result = await getVideoStatus(videoId);
 			if (result.share_url) {

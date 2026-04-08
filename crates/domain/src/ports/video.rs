@@ -34,11 +34,32 @@ pub trait VideoRepository: Send + Sync {
         new_status: VideoStatus,
     ) -> Result<bool, RepositoryError>;
 
+    /// Atomically write the share token while the video is still in
+    /// `Processing`. Used by the "publish share link as soon as the
+    /// low tier's first segment is playable" path — the full transition
+    /// to `Processed` still happens via [`Self::mark_processed`] once
+    /// the whole transcode finishes.
+    ///
+    /// Returns `true` if a row was updated; `false` means the video
+    /// was no longer in `Processing` (e.g. transitioned to `Failed`
+    /// between the check and the write). Single statement, no
+    /// transaction needed.
+    async fn set_share_token(
+        &self,
+        id: &VideoId,
+        share_token: &str,
+    ) -> Result<bool, RepositoryError>;
+
     /// Atomically transition `Processing → Processed` and write the
     /// share token in one statement. Returns `true` if a row was updated;
     /// `false` means the video was no longer in `Processing` (e.g.
     /// recovered to `Failed` by the safety-net sweep). Single statement,
     /// no transaction needed.
+    ///
+    /// Idempotent with respect to `share_token`: if the token was
+    /// already written by [`Self::set_share_token`] during the early-
+    /// publish path, calling this with the same token value is a no-op
+    /// for that column and only flips the status.
     async fn mark_processed(
         &self,
         id: &VideoId,
