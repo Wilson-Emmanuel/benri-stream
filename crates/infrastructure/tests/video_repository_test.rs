@@ -197,3 +197,184 @@ async fn delete_removes_the_row() {
     // Idempotent: deleting again is a no-op.
     repo.delete(&video.id).await.unwrap();
 }
+
+// ---- find_stale: all three transient statuses ----
+
+#[tokio::test]
+async fn find_stale_returns_all_three_transient_statuses() {
+    // The query's status filter is `IN ('PENDING_UPLOAD', 'UPLOADED',
+    // 'PROCESSING')`. Seed one old row of each and verify every one
+    // comes back — a typo in any of the three string literals would
+    // break this.
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+
+    let mut pending = fresh_video(VideoStatus::PendingUpload);
+    pending.created_at = Utc::now() - ChronoDuration::hours(48);
+    repo.insert(&pending).await.unwrap();
+
+    let mut uploaded = fresh_video(VideoStatus::Uploaded);
+    uploaded.created_at = Utc::now() - ChronoDuration::hours(48);
+    repo.insert(&uploaded).await.unwrap();
+
+    let mut processing = fresh_video(VideoStatus::Processing);
+    processing.created_at = Utc::now() - ChronoDuration::hours(48);
+    repo.insert(&processing).await.unwrap();
+
+    let stale = repo
+        .find_stale(Utc::now() - ChronoDuration::hours(24))
+        .await
+        .unwrap();
+    let ids: Vec<_> = stale.iter().map(|v| v.id.clone()).collect();
+    assert!(ids.contains(&pending.id), "PENDING_UPLOAD must be returned");
+    assert!(ids.contains(&uploaded.id), "UPLOADED must be returned");
+    assert!(
+        ids.contains(&processing.id),
+        "PROCESSING must be returned"
+    );
+}
+
+// ---- find_failed_before ----
+
+#[tokio::test]
+async fn find_failed_before_returns_only_old_failed_videos() {
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+
+    // Old FAILED: included.
+    let mut old_failed = fresh_video(VideoStatus::Failed);
+    old_failed.created_at = Utc::now() - ChronoDuration::hours(48);
+    repo.insert(&old_failed).await.unwrap();
+
+    // Recent FAILED: excluded by cutoff.
+    let recent_failed = fresh_video(VideoStatus::Failed);
+    repo.insert(&recent_failed).await.unwrap();
+
+    // Old PENDING_UPLOAD: excluded by status filter.
+    let mut old_pending = fresh_video(VideoStatus::PendingUpload);
+    old_pending.created_at = Utc::now() - ChronoDuration::hours(48);
+    repo.insert(&old_pending).await.unwrap();
+
+    let got = repo
+        .find_failed_before(Utc::now() - ChronoDuration::hours(24))
+        .await
+        .unwrap();
+    let ids: Vec<_> = got.iter().map(|v| v.id.clone()).collect();
+    assert!(ids.contains(&old_failed.id));
+    assert!(!ids.contains(&recent_failed.id));
+    assert!(!ids.contains(&old_pending.id));
+}
+
+// ---- All VideoFormat values round-trip through the DB ----
+
+#[tokio::test]
+async fn all_video_formats_round_trip_through_the_database() {
+    // `VideoFormat::as_str` writes to the DB, `VideoFormat::from_str`
+    // reads it back — any drift between the two lookup tables or a
+    // missing migration enum value would surface here.
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+
+    for format in [
+        VideoFormat::Mp4,
+        VideoFormat::Webm,
+        VideoFormat::Mov,
+        VideoFormat::Avi,
+        VideoFormat::Mkv,
+    ] {
+        let video = Video {
+            id: VideoId::new(),
+            share_token: None,
+            title: "t".into(),
+            format,
+            status: VideoStatus::PendingUpload,
+            upload_key: format!("uploads/{}/original", VideoId::new().0),
+            created_at: Utc::now(),
+        };
+        repo.insert(&video).await.unwrap();
+        let got = repo.find_by_id(&video.id).await.unwrap().unwrap();
+        assert_eq!(got.format, format, "format must round-trip for {format:?}");
+    }
+}
+
+// ---- All VideoStatus values round-trip through the DB ----
+
+#[tokio::test]
+async fn all_video_statuses_round_trip_through_the_database() {
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+
+    // Use update_status_if to drive the row through each state the
+    // production code actually uses. Then drop the row into Failed via
+    // bulk_mark_failed so every status the row mapper may read from
+    // the DB is exercised in one test.
+    let video = fresh_video(VideoStatus::PendingUpload);
+    repo.insert(&video).await.unwrap();
+
+    let states = [
+        (VideoStatus::PendingUpload, VideoStatus::Uploaded),
+        (VideoStatus::Uploaded, VideoStatus::Processing),
+    ];
+    for (from, to) in states {
+        assert!(repo.update_status_if(&video.id, from, to).await.unwrap());
+        let got = repo.find_by_id(&video.id).await.unwrap().unwrap();
+        assert_eq!(got.status, to);
+    }
+
+    // Processing → Processed via mark_processed.
+    let token: String = VideoId::new().0.simple().to_string().chars().take(21).collect();
+    assert!(repo.mark_processed(&video.id, &token).await.unwrap());
+    let got = repo.find_by_id(&video.id).await.unwrap().unwrap();
+    assert_eq!(got.status, VideoStatus::Processed);
+
+    // Separately exercise the Failed state via bulk_mark_failed on a
+    // different row (mark_processed can't transition away from
+    // Processed, and Failed is only reachable from the cleanup sweep).
+    let doomed = fresh_video(VideoStatus::PendingUpload);
+    repo.insert(&doomed).await.unwrap();
+    repo.update_status_if(&doomed.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
+        .await
+        .unwrap();
+    repo.bulk_mark_failed(
+        std::slice::from_ref(&doomed.id),
+        &[VideoStatus::Uploaded],
+    )
+    .await
+    .unwrap();
+    let got = repo.find_by_id(&doomed.id).await.unwrap().unwrap();
+    assert_eq!(got.status, VideoStatus::Failed);
+}
+
+// ---- bulk_mark_failed: empty input ----
+
+#[tokio::test]
+async fn bulk_mark_failed_with_empty_ids_is_ok() {
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+    repo.bulk_mark_failed(&[], &[VideoStatus::Uploaded])
+        .await
+        .unwrap();
+}
+
+// ---- update_status_if on missing row ----
+
+#[tokio::test]
+async fn update_status_if_returns_false_when_row_missing() {
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+    let ok = repo
+        .update_status_if(&VideoId::new(), VideoStatus::PendingUpload, VideoStatus::Uploaded)
+        .await
+        .unwrap();
+    assert!(!ok);
+}
+
+// ---- mark_processed on missing row ----
+
+#[tokio::test]
+async fn mark_processed_returns_false_when_row_missing() {
+    let pool = pg_pool().await;
+    let repo = PostgresVideoRepository::new(pool);
+    let ok = repo.mark_processed(&VideoId::new(), "tok").await.unwrap();
+    assert!(!ok);
+}
