@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait TranscoderPort: Send + Sync {
     async fn probe(&self, storage_key: &str) -> Result<ProbeResult, TranscoderError>;

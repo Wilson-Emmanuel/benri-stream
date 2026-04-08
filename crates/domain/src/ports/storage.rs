@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait StoragePort: Send + Sync {
     /// Generate a presigned URL the client can `PUT` directly to.

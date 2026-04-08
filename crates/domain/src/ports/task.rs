@@ -9,6 +9,7 @@ use crate::task::{Task, TaskId, TaskUpdate};
 /// Task creation that must be atomic with a business mutation goes through
 /// [`crate::ports::transaction::TransactionPort`] + `TaskMutations`
 /// instead.
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
     async fn find_by_id(&self, id: &TaskId) -> Result<Option<Task>, RepositoryError>;

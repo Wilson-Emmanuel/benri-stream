@@ -67,6 +67,7 @@ pub trait TxScope: Send {
 /// `update_status_if`, `mark_processed`) live on the pool-backed
 /// [`VideoRepository`](crate::ports::video::VideoRepository) and run as
 /// plain single-statement updates without an enclosing transaction.
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait VideoMutations: Send {
     /// Atomically set status only if current status matches `expected`.
@@ -83,6 +84,7 @@ pub trait VideoMutations: Send {
 /// atomic with a business mutation. Standalone scheduling (no business
 /// mutation to bundle) uses the pool-backed
 /// [`TaskRepository`](crate::ports::task::TaskRepository) instead.
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait TaskMutations: Send {
     async fn create(&mut self, task: &Task) -> Result<Task, RepositoryError>;

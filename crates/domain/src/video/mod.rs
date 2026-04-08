@@ -170,3 +170,4 @@ impl VideoFormat {
 pub fn generate_share_token() -> String {
     nanoid::nanoid!(SHARE_TOKEN_LENGTH)
 }
+

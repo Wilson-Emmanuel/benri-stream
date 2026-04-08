@@ -11,3 +11,12 @@ uuid.workspace = true
 nanoid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# Optional — pulled in only when the `mock` feature is enabled.
+# Application tests turn this on via their dev-dependencies so
+# mockall-generated mocks are available in the application crate.
+mockall = { workspace = true, optional = true }
+
+[features]
+default = []
+mock = ["dep:mockall"]

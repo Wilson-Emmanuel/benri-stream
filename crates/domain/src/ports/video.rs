@@ -9,6 +9,7 @@ use crate::video::{Video, VideoId, VideoStatus};
 /// with other mutations. Multi-statement atomic writes (e.g. update status
 /// + schedule task) go through
 /// [`crate::ports::transaction::TransactionPort`] instead.
+#[cfg_attr(feature = "mock", mockall::automock)]
 #[async_trait]
 pub trait VideoRepository: Send + Sync {
     // ---- Reads ----
