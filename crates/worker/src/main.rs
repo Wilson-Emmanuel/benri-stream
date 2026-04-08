@@ -2,7 +2,8 @@ mod consumer;
 mod poller;
 mod recovery;
 mod system_checker;
-mod handlers;
+
+use worker::handlers;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,15 +1,8 @@
-mod handlers;
-
-use axum::{routing::{get, post}, Router};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
 use application::usecases::video::{
-    complete_upload::CompleteUploadUseCase,
-    get_video_by_token::GetVideoByTokenUseCase,
-    get_video_status::GetVideoStatusUseCase,
-    initiate_upload::InitiateUploadUseCase,
+    complete_upload::CompleteUploadUseCase, get_video_by_token::GetVideoByTokenUseCase,
+    get_video_status::GetVideoStatusUseCase, initiate_upload::InitiateUploadUseCase,
 };
 use infrastructure::bootstrap::{create_pg_pool, create_s3_client};
 use infrastructure::config::AppConfig;
@@ -18,13 +11,7 @@ use infrastructure::postgres::transaction::PgTransactionPort;
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
 use infrastructure::storage::s3_client::S3StorageClient;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub initiate_upload: Arc<InitiateUploadUseCase>,
-    pub complete_upload: Arc<CompleteUploadUseCase>,
-    pub get_video_status: Arc<GetVideoStatusUseCase>,
-    pub get_video_by_token: Arc<GetVideoByTokenUseCase>,
-}
+use api::{build_router, AppState};
 
 #[tokio::main]
 async fn main() {
@@ -70,24 +57,22 @@ async fn main() {
     let state = AppState {
         initiate_upload: Arc::new(InitiateUploadUseCase::new(video_repo.clone(), storage.clone())),
         complete_upload: Arc::new(CompleteUploadUseCase::new(
-            video_repo.clone(), task_repo, tx_port, storage.clone(),
+            video_repo.clone(),
+            task_repo,
+            tx_port,
+            storage.clone(),
         )),
-        get_video_status: Arc::new(GetVideoStatusUseCase::new(video_repo.clone(), config.base_url.clone())),
+        get_video_status: Arc::new(GetVideoStatusUseCase::new(
+            video_repo.clone(),
+            config.base_url.clone(),
+        )),
         get_video_by_token: Arc::new(GetVideoByTokenUseCase::new(
             video_repo.clone(),
             config.cdn_base_url.clone(),
         )),
     };
 
-    let app = Router::new()
-        .route("/api/videos/initiate", post(handlers::video::initiate_upload))
-        .route("/api/videos/{id}/complete", post(handlers::video::complete_upload))
-        .route("/api/videos/{id}/status", get(handlers::video::get_video_status))
-        .route("/api/videos/share/{share_token}", get(handlers::video::get_video_by_token))
-        .route("/health", get(|| async { "ok" }))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await

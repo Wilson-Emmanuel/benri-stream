@@ -19,3 +19,9 @@ serde_json.workspace = true
 # aws-config are no longer direct deps — `create_s3_client` hides them.
 sqlx.workspace = true
 redis.workspace = true
+
+[dev-dependencies]
+infrastructure = { workspace = true, features = ["test-support", "gstreamer"] }
+aws-sdk-s3.workspace = true
+uuid.workspace = true
+serde.workspace = true

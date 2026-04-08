@@ -17,3 +17,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
+
+[dev-dependencies]
+infrastructure = { workspace = true, features = ["test-support"] }
+http-body-util = "0.1"
+chrono.workspace = true
+aws-sdk-s3.workspace = true

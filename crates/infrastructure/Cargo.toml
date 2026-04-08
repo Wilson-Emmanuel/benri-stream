@@ -29,3 +29,20 @@ tempfile = { workspace = true, optional = true }
 [features]
 default = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-pbutils", "dep:gstreamer-video", "dep:tempfile"]
+# Enables the `testing` module, which exposes testcontainers-backed
+# Postgres/Redis/MinIO fixtures so api and worker integration tests can
+# share the same bring-up code.
+test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies.testcontainers]
+workspace = true
+optional = true
+
+[dependencies.testcontainers-modules]
+workspace = true
+optional = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

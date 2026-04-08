@@ -39,6 +39,8 @@ gstreamer-video = "0.23"
 tempfile = "3"
 
 mockall = "0.13"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis", "minio"] }
 
 domain = { path = "crates/domain" }
 application = { path = "crates/application" }
