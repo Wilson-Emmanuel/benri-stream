@@ -1,6 +1,6 @@
 # Multi-stage build for the API server
 # Stage 1: build
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
 
@@ -12,11 +12,15 @@ COPY crates/infrastructure/Cargo.toml crates/infrastructure/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
 COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
 
-# Create dummy source files so cargo can resolve and build deps
+# Create dummy source files so cargo can resolve and build deps.
+# api and worker have both a lib.rs and a main.rs, so we stub both —
+# otherwise the cached dummy build only knows about the bin target and
+# cargo later gets confused when the real lib.rs appears.
 RUN mkdir -p crates/domain/src crates/application/src crates/infrastructure/src crates/api/src crates/worker/src && \
     echo "fn main() {}" > crates/api/src/main.rs && \
     echo "fn main() {}" > crates/worker/src/main.rs && \
-    touch crates/domain/src/lib.rs crates/application/src/lib.rs crates/infrastructure/src/lib.rs
+    touch crates/domain/src/lib.rs crates/application/src/lib.rs crates/infrastructure/src/lib.rs \
+          crates/api/src/lib.rs crates/worker/src/lib.rs
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -30,7 +34,11 @@ RUN cargo build --release -p api || true
 COPY crates ./crates
 COPY migrations ./migrations
 
-RUN touch crates/api/src/main.rs && cargo build --release -p api
+# Bump mtimes on every real source file so cargo discards the cached
+# dummy artifacts and rebuilds from the real code. Touching only
+# main.rs is insufficient when the dummy stage built empty libs —
+# cargo needs to see every lib.rs as "newer than the cached .rmeta".
+RUN find crates -name '*.rs' -exec touch {} + && cargo build --release -p api
 
 # Stage 2: runtime — minimal image with just the binary
 FROM debian:bookworm-slim

@@ -1,6 +1,6 @@
 # Multi-stage build for the worker (transcoder)
 # Stage 1: build
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
 
@@ -20,17 +20,24 @@ COPY crates/infrastructure/Cargo.toml crates/infrastructure/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
 COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
 
+# Stub every crate's lib + bin targets so the cached dummy build
+# matches the real crate layout. api and worker both expose a lib.rs
+# alongside their main.rs.
 RUN mkdir -p crates/domain/src crates/application/src crates/infrastructure/src crates/api/src crates/worker/src && \
     echo "fn main() {}" > crates/api/src/main.rs && \
     echo "fn main() {}" > crates/worker/src/main.rs && \
-    touch crates/domain/src/lib.rs crates/application/src/lib.rs crates/infrastructure/src/lib.rs
+    touch crates/domain/src/lib.rs crates/application/src/lib.rs crates/infrastructure/src/lib.rs \
+          crates/api/src/lib.rs crates/worker/src/lib.rs
 
 RUN cargo build --release -p worker || true
 
 # Now copy the real source and build
 COPY crates ./crates
 
-RUN touch crates/worker/src/main.rs && cargo build --release -p worker
+# Force cargo to re-examine every real source file so the cached dummy
+# artifacts are replaced. Touching only main.rs leaves stale lib.rmeta
+# in place for crates whose lib.rs was empty in the dummy stage.
+RUN find crates -name '*.rs' -exec touch {} + && cargo build --release -p worker
 
 # Stage 2: runtime — needs GStreamer plugins for actual transcoding
 FROM debian:bookworm-slim

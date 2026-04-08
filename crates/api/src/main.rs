@@ -4,7 +4,7 @@ use application::usecases::video::{
     complete_upload::CompleteUploadUseCase, get_video_by_token::GetVideoByTokenUseCase,
     get_video_status::GetVideoStatusUseCase, initiate_upload::InitiateUploadUseCase,
 };
-use infrastructure::bootstrap::{create_pg_pool, create_s3_client};
+use infrastructure::bootstrap::{create_pg_pool, create_s3_client, create_s3_presign_client};
 use infrastructure::config::AppConfig;
 use infrastructure::postgres::task_repository::PostgresTaskRepository;
 use infrastructure::postgres::transaction::PgTransactionPort;
@@ -37,14 +37,22 @@ async fn main() {
         .expect("Failed to run migrations");
     tracing::info!("api: migrations applied");
 
+    // The api signs upload URLs browsers will PUT to, so it needs
+    // a second S3 client whose endpoint is browser-reachable. In
+    // docker-compose this is `http://localhost:9000` via the host
+    // port forward; the backend client uses `http://minio:9000` from
+    // inside the container network. Against real AWS both endpoints
+    // collapse to the same host and the override is a no-op.
     let s3_client = create_s3_client(&config).await;
+    let s3_presign_client = create_s3_presign_client(&config).await;
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(
         S3StorageClient::new(
             s3_client,
             config.s3_upload_bucket.clone(),
             config.s3_output_bucket.clone(),
             config.cdn_base_url.clone(),
-        ),
+        )
+        .with_upload_presign_client(s3_presign_client),
     );
 
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =

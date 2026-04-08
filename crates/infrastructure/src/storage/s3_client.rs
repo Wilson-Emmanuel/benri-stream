@@ -22,6 +22,15 @@ use domain::ports::storage::{ObjectMetadata, PresignedUpload, StorageError, Stor
 /// already carry their prefix, so the adapter routes transparently.
 pub struct S3StorageClient {
     client: Client,
+    /// Optional second client used only when signing the upload URL
+    /// returned to browsers. When `None`, `client` is used for all
+    /// operations — correct for real AWS S3 and for the worker, which
+    /// never presigns upload URLs for browsers. When `Some`, the
+    /// override is used only for `generate_presigned_upload_url` so
+    /// the signed `Host` header matches the browser-reachable endpoint
+    /// (docker-compose + MinIO case — the internal `minio:9000` host
+    /// is not browser-reachable).
+    upload_presign_client: Option<Client>,
     upload_bucket: String,
     output_bucket: String,
     cdn_base_url: String,
@@ -39,16 +48,25 @@ impl S3StorageClient {
     ) -> Self {
         Self {
             client,
+            upload_presign_client: None,
             upload_bucket,
             output_bucket,
             cdn_base_url,
         }
     }
 
-    /// Pick the right bucket for a given storage key. Panics on unknown
-    /// prefixes — every caller in the codebase produces keys under
-    /// `uploads/` or `videos/`, and an unknown prefix indicates a
-    /// programming bug, not a runtime condition.
+    /// Override the S3 client used for signing browser-facing upload
+    /// URLs. Only the api ever needs this — see the
+    /// `upload_presign_client` field docs for context.
+    pub fn with_upload_presign_client(mut self, client: Client) -> Self {
+        self.upload_presign_client = Some(client);
+        self
+    }
+
+    /// Pick the right bucket for a given storage key. Panics on
+    /// unknown prefixes — every caller in the codebase produces keys
+    /// under `uploads/` or `videos/`, and an unknown prefix indicates
+    /// a programming bug, not a runtime condition.
     fn bucket_for(&self, key: &str) -> &str {
         if key.starts_with(UPLOAD_PREFIX) {
             &self.upload_bucket
@@ -84,8 +102,11 @@ impl StoragePort for S3StorageClient {
         let config = PresigningConfig::expires_in(Duration::from_secs(expiry_secs))
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let presigned = self
-            .client
+        // Use the dedicated upload-presign client if configured so
+        // the URL's Host header matches a browser-reachable endpoint.
+        // Falls back to the main client when no override is set.
+        let signer = self.upload_presign_client.as_ref().unwrap_or(&self.client);
+        let presigned = signer
             .put_object()
             .bucket(self.bucket_for(key))
             .key(key)
@@ -110,6 +131,10 @@ impl StoragePort for S3StorageClient {
         let config = PresigningConfig::expires_in(Duration::from_secs(expiry_secs))
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // Always signed with the main client (never the
+        // browser-facing override): this URL is consumed by the
+        // worker's GStreamer pipeline inside the same docker network
+        // as MinIO, so the backend endpoint is correct here.
         let presigned = self
             .client
             .get_object()

@@ -40,6 +40,8 @@ pub async fn build_test_app() -> TestApp {
     let s3 = minio_client().await;
     let ep = minio_endpoint().await;
 
+    // Tests point at a single MinIO container — no browser/backend
+    // split needed, so no upload_presign_client override.
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(S3StorageClient::new(
         s3.clone(),
         ep.upload_bucket.clone(),

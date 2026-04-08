@@ -18,10 +18,7 @@ async fn happy_path_inserts_video_and_returns_upload_url() {
     let mut video_repo = MockVideoRepository::new();
     let mut storage = MockStoragePort::new();
 
-    video_repo
-        .expect_insert()
-        .times(1)
-        .returning(|_| Ok(()));
+    video_repo.expect_insert().times(1).returning(|_| Ok(()));
     storage
         .expect_generate_presigned_upload_url()
         .times(1)

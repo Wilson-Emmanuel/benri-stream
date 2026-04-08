@@ -82,8 +82,12 @@ services:
       S3_OUTPUT_BUCKET: benri-stream
       S3_REGION: us-east-1
       S3_ENDPOINT: http://minio:9000
+      # Browser-facing endpoint for presigned upload URLs. Must be a
+      # hostname the user's browser can actually reach — the internal
+      # `minio` hostname above only resolves inside the docker network.
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
       CDN_BASE_URL: http://localhost:8888
-      BASE_URL: http://localhost:5173
+      BASE_URL: http://localhost:18080
       LISTEN_ADDR: 0.0.0.0:8080
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -119,7 +123,7 @@ services:
     depends_on:
       - api
     ports:
-      - "5173:80"
+      - "18080:80"
 
 volumes:
   pgdata:

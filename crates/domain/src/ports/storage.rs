@@ -22,8 +22,8 @@ pub trait StoragePort: Send + Sync {
     ) -> Result<PresignedUpload, StorageError>;
 
     /// Generate a presigned URL for reading an object. Used by the
-    /// transcoder so input files can be read without requiring the
-    /// bucket to be publicly readable.
+    /// worker's transcoder so input files can be read without requiring
+    /// the bucket to be publicly readable.
     async fn generate_presigned_download_url(
         &self,
         key: &str,

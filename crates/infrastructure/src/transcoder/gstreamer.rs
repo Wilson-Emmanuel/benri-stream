@@ -70,7 +70,7 @@ impl GstreamerTranscoder {
     /// uridecodebin3 ─┬─ videoconvert → video_tee ─┬─ queue → scale(360p)  → x264enc → h264parse ─┐
     ///                │                            ├─ queue → scale(720p)  → x264enc → h264parse ─┤
     ///                │                            └─ queue → scale(1080p) → x264enc → h264parse ─┤
-    ///                │                                                                            ├──▶ mpegtsmux(per level) ──▶ hlssink3(per level)
+    ///                │                                                                            ├──▶ hlssink2(per level, internal mpegtsmux)
     ///                └─ audioconvert → audioresample → avenc_aac → aacparse → audio_tee ────────┘
     ///                   (only built if the source has an audio stream)
     /// ```
@@ -163,20 +163,19 @@ impl GstreamerTranscoder {
 
         // Dynamic pad linking: uridecodebin3 exposes decoded video/audio
         // pads after stream discovery. Route each to the right front-end.
+        //
+        // We route by pad *name* (`video_%u` / `audio_%u`) rather than by
+        // caps because `uridecodebin3` exposes its source pads eagerly,
+        // before caps negotiation completes — `pad.current_caps()` is
+        // `None` at the moment `pad-added` fires. Pad names, by contrast,
+        // are part of `uridecodebin3`'s template and are always set, so
+        // they're a reliable type indicator at this point in the lifecycle.
         let video_convert_weak = video_convert.downgrade();
         let audio_convert_weak = audio_chain.as_ref().map(|(ac, _)| ac.downgrade());
         src.connect_pad_added(move |_, pad| {
-            let Some(caps) = pad.current_caps() else {
-                tracing::warn!("uridecodebin3: pad-added without caps");
-                return;
-            };
-            let Some(structure) = caps.structure(0) else {
-                tracing::warn!("uridecodebin3: pad-added caps without structure");
-                return;
-            };
-            let name = structure.name();
+            let pad_name = pad.name();
 
-            if name.starts_with("video/") {
+            if pad_name.starts_with("video_") {
                 let Some(convert) = video_convert_weak.upgrade() else { return };
                 let Some(sink_pad) = convert.static_pad("sink") else { return };
                 if sink_pad.is_linked() {
@@ -186,7 +185,7 @@ impl GstreamerTranscoder {
                 if let Err(e) = pad.link(&sink_pad) {
                     tracing::error!(error = %e, "failed to link video pad to videoconvert");
                 }
-            } else if name.starts_with("audio/") {
+            } else if pad_name.starts_with("audio_") {
                 let Some(weak) = &audio_convert_weak else {
                     // We didn't build an audio chain (has_audio was false
                     // during discovery). Unusual but possible if streams
@@ -260,42 +259,38 @@ impl GstreamerTranscoder {
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
 
-            // ---- Per-level MPEG-TS mux + HLS sink ----
-            let mux = gst::ElementFactory::make("mpegtsmux")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("mpegtsmux: {e}")))?;
-
+            // ---- Per-level HLS sink ----
+            // hlssink2 muxes to MPEG-TS internally and exposes request
+            // pads named literally `video` and `audio`. We feed it the
+            // already-parsed H.264 (and AAC, when present) elementary
+            // streams directly — no external mpegtsmux needed.
             let playlist_path = level_dir.join("playlist.m3u8");
             let segment_pattern = level_dir.join("segment_%05d.ts");
-            let hlssink = gst::ElementFactory::make("hlssink3")
+            let hlssink = gst::ElementFactory::make("hlssink2")
                 .property("target-duration", SEGMENT_DURATION_SECS)
                 .property("playlist-length", 0u32)
                 .property("playlist-location", playlist_path.to_str().unwrap())
                 .property("location", segment_pattern.to_str().unwrap())
                 .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink3: {e}")))?;
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink2: {e}")))?;
 
             pipeline
-                .add_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse, &mux, &hlssink])
+                .add_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse, &hlssink])
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("add level branch: {e}")))?;
 
             gst::Element::link_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse])
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("link video chain: {e}")))?;
 
-            // vparse → mpegtsmux (request pad)
-            let mux_video_sink = mux
-                .request_pad_simple("sink_%d")
-                .ok_or_else(|| TranscoderError::TranscodeFailed("mux video sink pad".into()))?;
+            // vparse → hlssink2.video (request pad)
+            let hls_video_sink = hlssink
+                .request_pad_simple("video")
+                .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 video pad".into()))?;
             let vparse_src = vparse
                 .static_pad("src")
                 .ok_or_else(|| TranscoderError::TranscodeFailed("vparse src pad".into()))?;
             vparse_src
-                .link(&mux_video_sink)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("link vparse→mux: {e}")))?;
-
-            // mpegtsmux → hlssink3
-            mux.link(&hlssink)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("link mux→hlssink: {e}")))?;
+                .link(&hls_video_sink)
+                .map_err(|e| TranscoderError::TranscodeFailed(format!("link vparse→hlssink: {e}")))?;
 
             // video_tee → vqueue
             let video_tee_src = video_tee
@@ -328,16 +323,16 @@ impl GstreamerTranscoder {
                     .link(&aqueue_sink)
                     .map_err(|e| TranscoderError::TranscodeFailed(format!("link audio tee: {e}")))?;
 
-                // aqueue → mpegtsmux (second request pad)
-                let mux_audio_sink = mux
-                    .request_pad_simple("sink_%d")
-                    .ok_or_else(|| TranscoderError::TranscodeFailed("mux audio sink pad".into()))?;
+                // aqueue → hlssink2.audio (request pad)
+                let hls_audio_sink = hlssink
+                    .request_pad_simple("audio")
+                    .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 audio pad".into()))?;
                 let aqueue_src = aqueue
                     .static_pad("src")
                     .ok_or_else(|| TranscoderError::TranscodeFailed("aqueue src pad".into()))?;
                 aqueue_src
-                    .link(&mux_audio_sink)
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("link aqueue→mux: {e}")))?;
+                    .link(&hls_audio_sink)
+                    .map_err(|e| TranscoderError::TranscodeFailed(format!("link aqueue→hlssink: {e}")))?;
             }
         }
 

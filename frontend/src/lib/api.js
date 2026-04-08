@@ -14,9 +14,14 @@ export async function initiateUpload(title, mimeType, filename) {
 }
 
 export async function uploadToStorage(uploadUrl, file, headers) {
-	const reqHeaders = {};
-	for (const h of headers) {
-		reqHeaders[h.name] = h.value;
+	// The API used to return a `headers` array for POST-policy uploads.
+	// The current PUT-presigned flow carries all auth in the URL itself,
+	// so `headers` is optional — only set Content-Type from the file.
+	const reqHeaders = { 'Content-Type': file.type };
+	if (Array.isArray(headers)) {
+		for (const h of headers) {
+			reqHeaders[h.name] = h.value;
+		}
 	}
 	const res = await fetch(uploadUrl, {
 		method: 'PUT',
