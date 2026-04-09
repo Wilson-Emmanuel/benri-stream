@@ -77,14 +77,42 @@
 				// bandwidth guess and 404. Starting at low guarantees
 				// a playable stream; hls.js still adapts upward once
 				// higher tiers become available and bandwidth allows.
-				const hls = new Hls({ startLevel: 0, debug: true });
+				//
+				// During early publish the variant playlist is an
+				// `EVENT` playlist with no `#EXT-X-ENDLIST` yet, which
+				// hls.js classifies as a live stream. Its default for
+				// live is to seek to the live edge (the most recently
+				// appended segment), so every fresh page load lands on
+				// a different scene while the clock reads 0:00 — that's
+				// the bug the user sees as "random scenes on refresh".
+				//
+				// The `Hls` config option `startPosition: 0` is a soft
+				// hint that live-stream startup logic overrides. The
+				// reliable override is to disable auto-start, wait for
+				// the manifest to parse, then call `startLoad(0)` —
+				// which pins the loader to absolute position 0 no
+				// matter how hls.js classified the playlist. We also
+				// push `currentTime = 0` on the video element as belt
+				// and suspenders so the media element itself doesn't
+				// race ahead to the live edge.
+				const hls = new Hls({
+					startLevel: 0,
+					autoStartLoad: false,
+					debug: true,
+				});
 
 				// Comprehensive event logging so we can see what hls.js
 				// is doing while we debug the early-publish playback
 				// path. Remove once playback is reliable.
-				hls.on(Hls.Events.MANIFEST_PARSED, (_, data) =>
-					console.log('[hls] MANIFEST_PARSED', data)
-				);
+				hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+					console.log('[hls] MANIFEST_PARSED', data);
+					// Kick off loading pinned to absolute position 0.
+					// Paired with `autoStartLoad: false` above, this
+					// is the only thing that reliably prevents live-
+					// edge startup for EVENT playlists in hls.js.
+					hls.startLoad(0);
+					if (videoEl) videoEl.currentTime = 0;
+				});
 				hls.on(Hls.Events.LEVEL_LOADED, (_, data) =>
 					console.log('[hls] LEVEL_LOADED', {
 						level: data.level,

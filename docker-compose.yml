@@ -119,6 +119,15 @@ services:
       # Worker doesn't render URLs to browsers, but keep this aligned
       # with the api so any future shared use of public_url is correct.
       CDN_BASE_URL: /cdn
+      # Dev: transcode only the low tier to cut encode time ~3× on
+      # CPU-only hosts. Three tiers is a production concern. Override
+      # with `QUALITY_TIERS=low,medium,high` for a production-like run.
+      QUALITY_TIERS: low
+      # Dev: allow two concurrent tasks so a second upload doesn't
+      # queue behind a still-running transcode. Tune up on beefier
+      # hosts. The ordering key on ProcessVideoTaskMetadata prevents
+      # two concurrent attempts on the same video regardless of this.
+      WORKER_CONCURRENCY: "2"
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
 

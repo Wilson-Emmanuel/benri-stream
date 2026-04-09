@@ -46,6 +46,17 @@ pub trait StoragePort: Send + Sync {
         content_type: &str,
     ) -> Result<(), StorageError>;
 
+    /// Upload an in-memory byte buffer under `key`. Used for small
+    /// objects (HLS playlists, ~hundreds of bytes) that the caller
+    /// has synthesized in memory and shouldn't have to round-trip
+    /// through the local filesystem.
+    async fn upload_bytes(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), StorageError>;
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError>;
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError>;

@@ -28,13 +28,20 @@ const INPUT_PRESIGN_TTL_SECS: u64 = 2 * 60 * 60;
 /// segments to a local temp dir, and uploads them to S3 *while the
 /// pipeline is still running* via a concurrent [`HlsUploader`] task.
 /// Workers are stateless — nothing persists between jobs.
+///
+/// `quality_tiers` is the ordered list of HLS quality tiers this
+/// transcoder produces for each video. Ordering is preserved into the
+/// master playlist (first entry is the player's default pick), so
+/// callers that want the cheapest tier to be the viewer's first hit
+/// should list it first.
 pub struct GstreamerTranscoder {
     storage: Arc<dyn StoragePort>,
+    quality_tiers: Vec<QualityLevel>,
 }
 
 impl GstreamerTranscoder {
-    pub fn new(storage: Arc<dyn StoragePort>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<dyn StoragePort>, quality_tiers: Vec<QualityLevel>) -> Self {
+        Self { storage, quality_tiers }
     }
 
     /// Generate a time-limited presigned GET URL for reading the input
@@ -73,12 +80,20 @@ impl GstreamerTranscoder {
     ///
     /// `has_audio` is determined upstream by `probe()` and threaded in,
     /// avoiding a second header read from S3.
-    fn run_parallel_pipeline(
+    ///
+    /// Returns the fully-linked pipeline ready for
+    /// [`Self::drive_pipeline_to_eos`]. The two steps are kept separate so the
+    /// caller can hold a shared `gst::Pipeline` handle and cancel the
+    /// running pipeline from outside — important because
+    /// `tokio::task::spawn_blocking` tasks are not cancellable through
+    /// their `JoinHandle`, so cancellation has to go through the
+    /// pipeline itself.
+    fn build_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
         quality_levels: &[QualityLevel],
         has_audio: bool,
-    ) -> Result<(), TranscoderError> {
+    ) -> Result<gstreamer::Pipeline, TranscoderError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
@@ -266,9 +281,20 @@ impl GstreamerTranscoder {
             // streams directly — no external mpegtsmux needed.
             let playlist_path = level_dir.join("playlist.m3u8");
             let segment_pattern = level_dir.join("segment_%05d.ts");
+            // `max-files = 0` means unlimited — do not let hlssink2
+            // rotate segment files off disk. The default is 10, which
+            // works for a classic live stream but breaks us: the
+            // concurrent uploader races against the rotation and
+            // occasionally tries to read a segment hlssink2 just
+            // deleted, producing an "IO error" that fails the whole
+            // transcode. We already remove each segment from the local
+            // temp dir the moment the uploader has it safely in S3, so
+            // disk usage is bounded by "segments produced but not yet
+            // uploaded" regardless of this setting.
             let hlssink = gst::ElementFactory::make("hlssink2")
                 .property("target-duration", SEGMENT_DURATION_SECS)
                 .property("playlist-length", 0u32)
+                .property("max-files", 0u32)
                 .property("playlist-location", playlist_path.to_str().unwrap())
                 .property("location", segment_pattern.to_str().unwrap())
                 .build()
@@ -336,19 +362,57 @@ impl GstreamerTranscoder {
             }
         }
 
-        // Run the pipeline to completion
+        Ok(pipeline)
+    }
+
+    /// Drive an already-built pipeline to EOS or error, polling the bus
+    /// on a short interval so the caller can cancel from outside by
+    /// flipping `cancel`.
+    ///
+    /// On normal EOS, returns `Ok(())`. On pipeline error, returns
+    /// `Err(TranscodeFailed(...))`. On cancellation (cancel flag set by
+    /// the caller), returns a specific "cancelled" error so the caller
+    /// can distinguish it from a "real" transcode failure if it wants to.
+    ///
+    /// Always sets the pipeline state back to `Null` before returning,
+    /// so resources are released deterministically even on the error
+    /// paths.
+    fn drive_pipeline_to_eos(
+        pipeline: &gstreamer::Pipeline,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), TranscoderError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use std::sync::atomic::Ordering;
+
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| TranscoderError::TranscodeFailed(format!("set playing: {e}")))?;
 
-        let bus = pipeline.bus().unwrap();
-        let mut error: Option<String> = None;
+        let bus = pipeline.bus().expect("pipeline has bus");
+        let poll_timeout = gst::ClockTime::from_mseconds(500);
+        let mut outcome: Result<(), TranscoderError> = Ok(());
 
-        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("pipeline cancellation requested; stopping bus loop");
+                outcome = Err(TranscoderError::TranscodeFailed(
+                    "cancelled by uploader failure".into(),
+                ));
+                break;
+            }
+            let msg = match bus.timed_pop(Some(poll_timeout)) {
+                Some(m) => m,
+                None => continue,
+            };
             match msg.view() {
                 gst::MessageView::Eos(_) => break,
                 gst::MessageView::Error(err) => {
-                    error = Some(format!("{} (debug: {:?})", err.error(), err.debug()));
+                    outcome = Err(TranscoderError::TranscodeFailed(format!(
+                        "{} (debug: {:?})",
+                        err.error(),
+                        err.debug()
+                    )));
                     break;
                 }
                 _ => {}
@@ -356,12 +420,7 @@ impl GstreamerTranscoder {
         }
 
         pipeline.set_state(gst::State::Null).ok();
-
-        if let Some(err_msg) = error {
-            return Err(TranscoderError::TranscodeFailed(err_msg));
-        }
-
-        Ok(())
+        outcome
     }
 }
 
@@ -426,6 +485,8 @@ impl TranscoderPort for GstreamerTranscoder {
         first_segment_ready: Box<dyn FirstSegmentNotifier>,
     ) -> Result<(), TranscoderError> {
         use gstreamer as gst;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         tracing::info!(
             input_key,
@@ -440,13 +501,27 @@ impl TranscoderPort for GstreamerTranscoder {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| TranscoderError::TranscodeFailed(format!("tempdir: {e}")))?;
         let temp_path = temp_dir.path().to_path_buf();
-        let quality_levels = QualityLevel::all().to_vec();
+        let quality_levels = self.quality_tiers.clone();
+
+        // Build the pipeline synchronously on the async task. Element
+        // construction and linking are cheap and non-blocking, and
+        // doing it here means we get a `gst::Pipeline` handle we can
+        // share with both the blocking driver and the async
+        // cancellation path below.
+        let pipeline = Self::build_parallel_pipeline(
+            &input_url,
+            &temp_path,
+            &quality_levels,
+            probe.has_audio,
+        )?;
+
+        // Shared cancellation flag. The uploader-failure path sets it
+        // to `true`, and the blocking pipeline driver checks it between
+        // bus polls (every 500 ms) and exits promptly.
+        let cancel = Arc::new(AtomicBool::new(false));
 
         // Kick off the uploader *before* the pipeline so it catches
-        // segments from the moment they're written. It runs in its
-        // own tokio task, polling the temp dir; see
-        // `hls_uploader::HlsUploader` for the details. We signal it to
-        // stop via `stop_tx` once the pipeline has left `Playing`.
+        // segments from the moment they're written.
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let uploader = HlsUploader::new(
             temp_path.clone(),
@@ -456,56 +531,73 @@ impl TranscoderPort for GstreamerTranscoder {
             probe.has_audio,
             first_segment_ready,
         );
-        let uploader_handle = tokio::spawn(uploader.run(stop_rx));
+        let mut uploader_handle = tokio::spawn(uploader.run(stop_rx));
 
-        // GStreamer's bus iteration blocks the thread, so the pipeline
-        // runs inside `spawn_blocking`. Run in parallel with the
-        // uploader task above.
-        let pipeline_result =
-            Self::run_pipeline_blocking(input_url, temp_path, quality_levels, probe.has_audio)
-                .await;
+        // Drive the pipeline to EOS on a blocking thread. We move a
+        // clone of the pipeline into the closure; the outer clone
+        // stays on the async task so we can cancel it.
+        let mut pipeline_handle = tokio::task::spawn_blocking({
+            let pipeline = pipeline.clone();
+            let cancel = cancel.clone();
+            move || Self::drive_pipeline_to_eos(&pipeline, &cancel)
+        });
 
-        // Tell the uploader the pipeline has stopped (whether success
-        // or failure) so it runs one final drain pass and exits.
-        // Ignore the send error: if the receiver is already gone, the
-        // uploader task has already returned.
-        let _ = stop_tx.send(());
+        // Race the two. Whichever finishes first decides how the other
+        // winds down:
+        //
+        // - **Pipeline finishes first** (normal case): signal the
+        //   uploader to drain and await it. Any uploader error becomes
+        //   the transcode error.
+        // - **Uploader finishes first**: it only exits early on error.
+        //   Flip the cancel flag, wait for the pipeline driver to
+        //   notice and unwind (up to 500 ms + cleanup), and return the
+        //   uploader's error.
+        let final_result: Result<(), TranscoderError> = tokio::select! {
+            pipeline_join = &mut pipeline_handle => {
+                // Normal path: pipeline finished (success or error).
+                let pipeline_result = pipeline_join.map_err(|e| {
+                    TranscoderError::TranscodeFailed(format!("pipeline task join: {e}"))
+                })?;
+                // Signal the uploader to run its final drain. If the
+                // receiver is already gone (uploader errored out at
+                // the same instant) this is a harmless no-op.
+                let _ = stop_tx.send(());
+                let uploader_result = uploader_handle.await.map_err(|e| {
+                    TranscoderError::TranscodeFailed(format!("uploader task join: {e}"))
+                })?;
+                // Pipeline error wins; otherwise propagate uploader error.
+                pipeline_result.and(uploader_result)
+            }
+            uploader_join = &mut uploader_handle => {
+                // Uploader exited before the pipeline — it only does
+                // that on error. Cancel the pipeline so it doesn't
+                // waste the next several minutes encoding into a
+                // doomed temp dir.
+                tracing::warn!(
+                    "uploader exited before pipeline; cancelling pipeline to unwind transcode",
+                );
+                cancel.store(true, Ordering::Relaxed);
+                // Wait for the pipeline driver to notice and return.
+                // Ignore its result — the uploader error is the real
+                // cause, and we don't want a "cancelled" error to
+                // mask it.
+                let _ = pipeline_handle.await;
+                match uploader_join {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(TranscoderError::TranscodeFailed(format!(
+                        "uploader task join: {e}"
+                    ))),
+                }
+            }
+        };
 
-        // Wait for the uploader to finish its final drain before we
-        // return — otherwise the temp dir drops and we'd race the
-        // final playlist upload against the directory disappearing.
-        let uploader_result = uploader_handle
-            .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("uploader join: {e}")))?;
+        // Make sure the pipeline is in Null state no matter which path
+        // we took above — belt and braces for resource release before
+        // `temp_dir` drops and wipes the working directory.
+        use gstreamer::prelude::*;
+        let _ = pipeline.set_state(gst::State::Null);
 
-        // Pipeline errors win: if the encode failed, surface that
-        // regardless of what the uploader saw. Only if the pipeline
-        // succeeded do we care about the uploader's outcome (it might
-        // have failed to upload the final segment, for example).
-        pipeline_result?;
-        uploader_result?;
-
-        // Temp dir is cleaned up when `temp_dir` drops here.
-        Ok(())
-    }
-}
-
-impl GstreamerTranscoder {
-    /// Run the full GStreamer pipeline on a blocking thread. The pipeline
-    /// is constructed and driven to EOS entirely synchronously because
-    /// GStreamer's bus iteration blocks. Splitting this out of
-    /// `transcode_to_hls` keeps the async method small enough to read
-    /// at a glance.
-    async fn run_pipeline_blocking(
-        input_url: String,
-        temp_path: std::path::PathBuf,
-        quality_levels: Vec<QualityLevel>,
-        has_audio: bool,
-    ) -> Result<(), TranscoderError> {
-        tokio::task::spawn_blocking(move || {
-            Self::run_parallel_pipeline(&input_url, &temp_path, &quality_levels, has_audio)
-        })
-        .await
-        .map_err(|e| TranscoderError::TranscodeFailed(format!("pipeline task join: {e}")))?
+        final_result
     }
 }

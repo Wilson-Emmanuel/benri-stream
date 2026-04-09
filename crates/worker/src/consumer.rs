@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use domain::ports::task::{TaskConsumer, TaskRepository};
@@ -17,6 +18,11 @@ pub struct TaskConsumerLoop {
     consumer: Arc<dyn TaskConsumer>,
     task_repo: Arc<dyn TaskRepository>,
     handler: Arc<dyn TaskHandlerInvoker>,
+    /// Limits how many tasks this worker can be running at once. The
+    /// consumer acquires a permit before popping the next task and
+    /// releases it when the task finishes, so the pop loop naturally
+    /// backpressures against the concurrency cap.
+    concurrency: Arc<Semaphore>,
 }
 
 impl TaskConsumerLoop {
@@ -24,47 +30,99 @@ impl TaskConsumerLoop {
         consumer: Arc<dyn TaskConsumer>,
         task_repo: Arc<dyn TaskRepository>,
         handler: Arc<dyn TaskHandlerInvoker>,
+        max_concurrent_tasks: usize,
     ) -> Self {
-        Self { consumer, task_repo, handler }
-    }
-
-    /// Consume tasks until `shutdown` is set to `true`. On shutdown, any
-    /// in-flight task is allowed to finish (bounded by its processing
-    /// timeout). No new tasks are popped.
-    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
-        loop {
-            if *shutdown.borrow() {
-                tracing::info!("task consumer shutting down");
-                return;
-            }
-
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        tracing::info!("task consumer shutting down");
-                        return;
-                    }
-                }
-                pop_result = self.consumer.pop() => {
-                    match pop_result {
-                        Ok(Some(task_id)) => {
-                            self.process_one(&task_id).await;
-                        }
-                        Ok(None) => {
-                            tokio::time::sleep(EMPTY_POLL_DELAY).await;
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to pop from queue");
-                            tokio::time::sleep(POP_ERROR_DELAY).await;
-                        }
-                    }
-                }
-            }
+        Self {
+            consumer,
+            task_repo,
+            handler,
+            concurrency: Arc::new(Semaphore::new(max_concurrent_tasks)),
         }
     }
 
-    async fn process_one(&self, task_id: &TaskId) {
-        let task: Arc<Task> = match self.task_repo.find_by_id(task_id).await {
+    /// Consume tasks until `shutdown` is set to `true`. On shutdown, any
+    /// in-flight tasks are allowed to finish (bounded by their
+    /// processing timeouts). No new tasks are popped.
+    ///
+    /// Concurrency shape: the loop holds up to `max_concurrent_tasks`
+    /// in-flight handler runs via a `Semaphore`, acquiring a permit
+    /// *before* popping from the queue so we never take a task off
+    /// Redis we don't have capacity to run. Each permit is held for
+    /// the lifetime of the spawned per-task future — the semaphore's
+    /// internal counter backpressures the pop loop automatically.
+    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
+        // Track in-flight per-task futures so shutdown can drain them.
+        let mut in_flight: JoinSet<()> = JoinSet::new();
+
+        loop {
+            if *shutdown.borrow() {
+                tracing::info!(
+                    in_flight = in_flight.len(),
+                    "task consumer shutting down; waiting for in-flight tasks to drain",
+                );
+                while in_flight.join_next().await.is_some() {}
+                return;
+            }
+
+            // Block the pop loop until we have capacity to actually
+            // run whatever we pop. Attaching the permit to the spawned
+            // task's lifetime (via `OwnedSemaphorePermit`) keeps the
+            // accounting automatic — when the task future finishes, the
+            // permit drops and a new slot opens up.
+            let permit = tokio::select! {
+                _ = shutdown.changed() => continue,
+                res = self.concurrency.clone().acquire_owned() => {
+                    match res {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // Semaphore closed — shouldn't happen.
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let pop_result = tokio::select! {
+                _ = shutdown.changed() => continue,
+                r = self.consumer.pop() => r,
+            };
+
+            match pop_result {
+                Ok(Some(task_id)) => {
+                    let task_repo = self.task_repo.clone();
+                    let handler = self.handler.clone();
+                    in_flight.spawn(async move {
+                        Self::process_one(&task_repo, &handler, &task_id).await;
+                        drop(permit);
+                    });
+                }
+                Ok(None) => {
+                    drop(permit);
+                    tokio::time::sleep(EMPTY_POLL_DELAY).await;
+                }
+                Err(e) => {
+                    drop(permit);
+                    tracing::error!(error = %e, "failed to pop from queue");
+                    tokio::time::sleep(POP_ERROR_DELAY).await;
+                }
+            }
+
+            // Reap any finished in-flight tasks opportunistically so
+            // the JoinSet doesn't grow unbounded. `try_join_next` is
+            // non-blocking and just drains whatever is already done.
+            while in_flight.try_join_next().is_some() {}
+        }
+    }
+
+    /// Run a single task through the handler dispatcher and persist
+    /// the outcome. No `&self` so it can be called from a detached
+    /// tokio task without a 'static bound on `Self`.
+    async fn process_one(
+        task_repo: &Arc<dyn TaskRepository>,
+        handler: &Arc<dyn TaskHandlerInvoker>,
+        task_id: &TaskId,
+    ) {
+        let task: Arc<Task> = match task_repo.find_by_id(task_id).await {
             Ok(Some(t)) => Arc::new(t),
             Ok(None) => {
                 tracing::warn!(task_id = %task_id, "task not found in DB, skipping");
@@ -101,7 +159,7 @@ impl TaskConsumerLoop {
 
         // Dispatcher owns timeout enforcement and compute_update — the
         // consumer just hands it the task and writes the resulting update.
-        let handler = self.handler.clone();
+        let handler = handler.clone();
         let task_for_dispatch = task.clone();
         let outcome = async move { handler.dispatch(&task_for_dispatch).await }
             .instrument(span)
@@ -110,7 +168,7 @@ impl TaskConsumerLoop {
         let metadata_type = task.metadata_type.clone();
         let outcome_kind = outcome.kind;
 
-        if let Err(e) = self.task_repo.batch_update(&[outcome.update]).await {
+        if let Err(e) = task_repo.batch_update(&[outcome.update]).await {
             tracing::error!(
                 task_id = %task.id,
                 error = %e,

@@ -10,30 +10,34 @@
 //!
 //! Design sketch:
 //!
-//! - The GStreamer pipeline writes segments and per-tier playlists into
-//!   a local temp directory (one subdirectory per quality level).
-//! - This uploader runs concurrently in a tokio task, polling the temp
-//!   dir every [`POLL_INTERVAL`] and diffing against what it has
-//!   already uploaded.
-//! - Segments are uploaded in filename order. The most recent segment
-//!   in each tier is held back on normal ticks because hlssink2 may
-//!   still be writing to it; a final drain after the pipeline stops
-//!   picks up those last segments.
-//! - Per-tier playlists are re-uploaded whenever hlssink2 rewrites them
-//!   (detected by mtime). The final rewrite — the one that appends
-//!   `#EXT-X-ENDLIST` — happens at EOS and is picked up by the drain.
-//! - Master playlist generation is deterministic from the quality
-//!   ladder and `has_audio`, so it's generated locally (no probing)
-//!   and uploaded exactly once, the first tick after the low tier has
-//!   a segment on S3. At that same moment we also force-upload
-//!   `low/playlist.m3u8` if it exists, so a viewer following the
-//!   share link sees master + the low variant playlist + at least
-//!   one segment all in place, not master alone with 404'd variants.
+//! - The GStreamer pipeline writes segments into a local temp
+//!   directory (one subdirectory per quality level). We do **not**
+//!   use hlssink2's on-disk `playlist.m3u8` at all — we synthesize
+//!   our own playlist from the set of segments we've actually
+//!   uploaded to storage, and that synthesized playlist is the one
+//!   the viewer's player fetches. This keeps the S3 state
+//!   authoritative: the segments listed in the playlist are exactly
+//!   the segments that exist on S3, by construction.
+//! - A background tokio task polls the temp dir every
+//!   [`POLL_INTERVAL`]. For each tier it uploads any newly-created
+//!   segments (all but the most recent, which hlssink2 may still be
+//!   writing), then regenerates the tier's variant playlist from the
+//!   uploaded-segment list and uploads it too — but only when the
+//!   playlist content actually changed.
+//! - First-segment trigger: the moment the low tier's first segment
+//!   is durably uploaded, we publish the master playlist (deterministic
+//!   from the ladder + `has_audio`) and fire the caller's
+//!   [`FirstSegmentNotifier`]. That same tick uploads the low variant
+//!   playlist listing the single segment, so the viewer's player has
+//!   something playable to attach to.
+//! - On final drain (after the pipeline stops), each tier's playlist
+//!   is regenerated with `#EXT-X-ENDLIST` appended so the player
+//!   knows playback is complete and stops polling.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use domain::ports::storage::StoragePort;
 use domain::ports::transcoder::{FirstSegmentNotifier, TranscoderError};
@@ -48,8 +52,8 @@ use super::quality::QualityLevel;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const SEGMENT_EXTENSION: &str = "ts";
-const PLAYLIST_FILENAME: &str = "playlist.m3u8";
 const MASTER_FILENAME: &str = "master.m3u8";
+const PLAYLIST_FILENAME: &str = "playlist.m3u8";
 const TS_CONTENT_TYPE: &str = "video/mp2t";
 const HLS_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
@@ -70,23 +74,24 @@ pub(super) struct HlsUploader {
 /// surface stays small.
 #[derive(Default)]
 struct UploadState {
-    /// Local segment paths already uploaded to S3. Tracked as
-    /// `HashSet<PathBuf>` so the "already uploaded, skip" check in
-    /// [`HlsUploader::upload_one_segment`] is O(1), and so a failed
-    /// local `remove_file` doesn't cause a re-upload on the next tick.
-    uploaded_segments: HashSet<PathBuf>,
-    /// Last-observed mtime of each tier's `playlist.m3u8`. We re-upload
-    /// only when this changes, so a healthy pipeline with 30 ticks /
-    /// minute doesn't spam S3 with identical ~300-byte playlists.
-    playlist_mtimes: std::collections::HashMap<PathBuf, SystemTime>,
+    /// Ordered filenames of segments we've uploaded for each tier.
+    /// Used both for the "already uploaded" check and for
+    /// synthesizing the variant playlist that goes to S3. The
+    /// invariant is: whatever is listed in `uploaded_segments[tier]`
+    /// is exactly what's in S3 under `output_prefix/tier/`, and that
+    /// same list is what the synthesized playlist references.
+    uploaded_segments: HashMap<QualityLevel, Vec<String>>,
+    /// Last playlist content we uploaded for each tier, so a tick
+    /// that produced no new segments skips re-uploading an identical
+    /// playlist instead of spamming S3 with ~300 bytes per tick.
+    last_published_playlist: HashMap<QualityLevel, String>,
     /// Flips to `true` the instant the first low-tier segment has
     /// finished uploading to storage. Used as the gating condition
-    /// for master + notifier publication — kept as a plain bool so
-    /// the trigger can't be accidentally broken by a path-matching
-    /// bug on the uploaded-segments set.
+    /// for master + notifier publication.
     first_low_segment_uploaded: bool,
     /// Whether `master.m3u8` has been written and uploaded. Set
-    /// exactly once, in the same tick as `first_low_segment_uploaded`.
+    /// exactly once, in the same tick as
+    /// `first_low_segment_uploaded`.
     master_uploaded: bool,
 }
 
@@ -114,10 +119,11 @@ impl HlsUploader {
     /// or when a storage error aborts the upload.
     ///
     /// The final tick after the stop signal runs with
-    /// `include_most_recent_segments = true`, which picks up the last
-    /// segment of each tier (which the normal tick holds back because
-    /// hlssink2 may still be writing it) plus the final playlist
-    /// rewrite that contains `#EXT-X-ENDLIST`.
+    /// [`TickMode::FinalDrain`], which picks up the last segment of
+    /// each tier (which the normal tick holds back because hlssink2
+    /// may still be writing it) and uploads each tier's variant
+    /// playlist with `#EXT-X-ENDLIST` appended so the player knows
+    /// to stop polling.
     pub(super) async fn run(
         mut self,
         mut stop_rx: oneshot::Receiver<()>,
@@ -139,19 +145,23 @@ impl HlsUploader {
         for level in self.quality_levels.clone() {
             self.upload_tier(level, mode).await?;
         }
-        // Backstop publish in case `upload_one_segment` didn't hit
-        // the inline path (e.g. the final-drain tick after a failure
-        // where the first low segment landed but the inline publish
-        // hit a transient error). Cheap no-op once `master_uploaded`
-        // is set.
-        self.publish_master_if_ready().await?;
         Ok(())
     }
 
-    /// Upload any new segments and the variant playlist for a single
-    /// quality level. On [`TickMode::Running`] the most recent segment
-    /// is held back (hlssink2 may still be writing it); on
-    /// [`TickMode::FinalDrain`] everything gets uploaded.
+    /// Upload any new segments for `level`, republishing the tier's
+    /// variant playlist after **each** one so it always matches the
+    /// segments actually in S3. On [`TickMode::Running`] the most
+    /// recent segment on disk is held back (hlssink2 may still be
+    /// writing it); on [`TickMode::FinalDrain`] everything is
+    /// uploaded and the playlist is finalized with `#EXT-X-ENDLIST`.
+    ///
+    /// Publishing per-segment (not just at end-of-tick) matters when
+    /// a tick has multiple new segments to upload and each upload
+    /// takes non-trivial time. End-of-tick publishing would leave the
+    /// S3 playlist stale for the duration of the entire for loop,
+    /// and a viewer polling during that window would never see the
+    /// in-flight segments. The extra uploads are small (a few hundred
+    /// bytes) and deduplicated by content, so the cost is negligible.
     async fn upload_tier(
         &mut self,
         level: QualityLevel,
@@ -162,17 +172,33 @@ impl HlsUploader {
             return Ok(());
         }
 
-        let scan = scan_tier_dir(&tier_dir)?;
-        let uploadable = select_uploadable_segments(&scan.segments, mode);
-
+        let on_disk = scan_segments(&tier_dir)?;
+        let uploadable = select_uploadable_segments(&on_disk, mode);
+        // Intermediate publishes inside the loop always use
+        // `Running` mode, even when the enclosing tick is a drain.
+        // Publishing with `FinalDrain` mid-loop would attach
+        // `#EXT-X-ENDLIST` to a partial playlist — a viewer polling
+        // during the drain would see "playback complete, these N
+        // segments are the whole stream" and stop, even though more
+        // segments are still being uploaded after it.
+        //
+        // The single publish after the loop *is* allowed to use the
+        // real mode, so the finalization happens exactly once —
+        // after every segment the drain is going to upload has
+        // actually landed in storage.
         for segment_path in uploadable {
             self.upload_one_segment(segment_path, level).await?;
+            self.publish_variant_playlist_if_changed(level, TickMode::Running)
+                .await?;
         }
 
-        if let Some(playlist_path) = scan.playlist {
-            self.upload_playlist_if_changed(&playlist_path, level).await?;
-        }
-
+        // Final publish with the *actual* mode — this is what flips
+        // the playlist to its finalized form on a drain tick. Also
+        // covers the drain-with-no-new-segments case: if the loop
+        // above had nothing to do, we still publish here and the
+        // content comparison inside will detect the `EVENT` →
+        // `ENDLIST` transition and push the finalized version.
+        self.publish_variant_playlist_if_changed(level, mode).await?;
         Ok(())
     }
 
@@ -181,16 +207,25 @@ impl HlsUploader {
         segment_path: &Path,
         level: QualityLevel,
     ) -> Result<(), TranscoderError> {
-        if self.state.uploaded_segments.contains(segment_path) {
+        let filename = match segment_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => return Ok(()),
+        };
+
+        // Already uploaded? Skip. This also dedupes cases where a
+        // slow tick saw the same file twice because the local delete
+        // below failed or raced a filesystem cache.
+        if self
+            .state
+            .uploaded_segments
+            .get(&level)
+            .map(|v| v.iter().any(|n| n == &filename))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
 
-        let filename = match segment_path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name,
-            None => return Ok(()),
-        };
-        let key = tier_object_key(&self.output_prefix, level, filename);
-
+        let key = tier_object_key(&self.output_prefix, level, &filename);
         self.storage
             .upload_from_path(segment_path, &key, TS_CONTENT_TYPE)
             .await
@@ -198,167 +233,110 @@ impl HlsUploader {
 
         // Remove the local file so long runs don't pile up gigabytes
         // of already-uploaded segments in the temp dir. Ignore the
-        // result — a failure here means the next tick's read_dir will
-        // skip it via `uploaded_segments`, not re-upload.
+        // result — a failure here means the next tick's scan will
+        // find the file again, and the `already uploaded` check at
+        // the top of this function will skip it.
         let _ = tokio::fs::remove_file(segment_path).await;
 
         self.state
             .uploaded_segments
-            .insert(segment_path.to_path_buf());
+            .entry(level)
+            .or_default()
+            .push(filename.clone());
+
+        tracing::info!(
+            tier = level.name(),
+            segment = %filename,
+            total_uploaded_for_tier = self
+                .state
+                .uploaded_segments
+                .get(&level)
+                .map(|v| v.len())
+                .unwrap_or(0),
+            "uploaded segment",
+        );
 
         // First-low-segment gate: publish master + fire the share-link
-        // notifier *inline*, right here in the same `upload_one_segment`
-        // call. It is tempting to defer this to the end of the tick —
-        // but a single tick walks all three tiers sequentially and each
-        // upload can take tens of seconds on a loaded encoder, so the
-        // "end of tick" moment is effectively "end of the transcode",
-        // i.e. way too late for a time-to-share improvement. Publishing
-        // inline means the share link goes out within a few hundred
-        // milliseconds of seg0 landing in storage, while the rest of
-        // the tick (seg1, medium, high) continues afterwards.
+        // notifier *inline*, in the same call. Publishing later (at
+        // the end of the tick) would wait for the remaining low
+        // segments + medium + high to upload, which on a CPU-bound
+        // host is effectively "end of the transcode".
         if level == QualityLevel::Low && !self.state.first_low_segment_uploaded {
             self.state.first_low_segment_uploaded = true;
             tracing::info!(
                 segment = %filename,
                 "first low-tier segment uploaded; publishing share link inline",
             );
-            self.publish_master_if_ready().await?;
+            self.publish_master_and_notify().await?;
         }
 
         Ok(())
     }
 
-    async fn upload_playlist_if_changed(
+    /// Synthesize the variant playlist for `level` from the list of
+    /// segments we've uploaded so far, and push it to S3 if it differs
+    /// from what we pushed last time. On [`TickMode::FinalDrain`] the
+    /// playlist is finalized with `#EXT-X-ENDLIST`.
+    async fn publish_variant_playlist_if_changed(
         &mut self,
-        playlist_path: &Path,
         level: QualityLevel,
+        mode: TickMode,
     ) -> Result<(), TranscoderError> {
-        let mtime = match current_mtime(playlist_path) {
-            Some(m) => m,
-            None => return Ok(()),
-        };
-        if self.state.playlist_mtimes.get(playlist_path) == Some(&mtime) {
+        let empty = Vec::new();
+        let segments = self
+            .state
+            .uploaded_segments
+            .get(&level)
+            .unwrap_or(&empty);
+        if segments.is_empty() {
             return Ok(());
         }
-        self.upload_playlist_now(playlist_path, level).await?;
-        self.state
-            .playlist_mtimes
-            .insert(playlist_path.to_path_buf(), mtime);
-        Ok(())
-    }
 
-    /// Upload a variant playlist *now*, bypassing the mtime guard.
-    /// Used when we publish the master playlist: we want to guarantee
-    /// `low/playlist.m3u8` is in storage alongside `master.m3u8` so
-    /// the player's first variant fetch doesn't 404 while waiting for
-    /// hlssink2 to flush an updated playlist on its own schedule.
-    async fn upload_playlist_now(
-        &self,
-        playlist_path: &Path,
-        level: QualityLevel,
-    ) -> Result<(), TranscoderError> {
+        let finalize = matches!(mode, TickMode::FinalDrain);
+        let body = synthesize_variant_playlist(segments, finalize);
+        let previous = self.state.last_published_playlist.get(&level);
+        if previous == Some(&body) {
+            return Ok(());
+        }
+
         let key = tier_object_key(&self.output_prefix, level, PLAYLIST_FILENAME);
         self.storage
-            .upload_from_path(playlist_path, &key, HLS_CONTENT_TYPE)
+            .upload_bytes(&key, body.as_bytes(), HLS_CONTENT_TYPE)
             .await
             .map_err(|e| TranscoderError::TranscodeFailed(format!("upload playlist: {e}")))?;
+        tracing::info!(
+            tier = level.name(),
+            segments = segments.len(),
+            finalized = finalize,
+            "published variant playlist",
+        );
+        self.state.last_published_playlist.insert(level, body);
         Ok(())
     }
 
-    async fn publish_master_if_ready(&mut self) -> Result<(), TranscoderError> {
+    async fn publish_master_and_notify(&mut self) -> Result<(), TranscoderError> {
         if self.state.master_uploaded {
             return Ok(());
         }
-        if !self.state.first_low_segment_uploaded {
-            return Ok(());
-        }
-
         tracing::info!("publishing master playlist and firing share-link notifier");
 
-        // Synthesize a minimal event-style low variant playlist that
-        // references exactly the segments we've already uploaded to
-        // storage, and upload it. We cannot trust hlssink2's on-disk
-        // playlist here — it is often empty or header-only at this
-        // moment because hlssink2 flushes its playlist file lazily
-        // (we've observed it only writing a complete playlist at
-        // tier-end). Uploading hlssink2's empty version would leave
-        // the player loading a playlist with zero segments, which
-        // renders as a 0:00 broken stream. Our synthesized version
-        // is always consistent with the segment set currently in S3.
-        self.publish_synthetic_low_playlist().await?;
+        // Publish the low variant playlist inline too so the viewer's
+        // player can resolve its first variant fetch without racing
+        // the next tick. Content is derived from the uploaded-segment
+        // list; by the time we're here `uploaded_segments[Low]` has
+        // at least one filename (the segment we just uploaded).
+        self.publish_variant_playlist_if_changed(QualityLevel::Low, TickMode::Running)
+            .await?;
 
-        self.write_and_upload_master().await?;
-        self.state.master_uploaded = true;
-        self.fire_notifier_once();
-        Ok(())
-    }
-
-    /// Write a minimal event-style playlist for the low tier listing
-    /// exactly the segments we've uploaded so far, and push it to
-    /// storage under `low/playlist.m3u8`. The `#EXT-X-PLAYLIST-TYPE:
-    /// EVENT` tag tells the player to keep polling for updates; each
-    /// subsequent hlssink2 playlist rewrite that reaches us via the
-    /// mtime-guarded path replaces this one with progressively more
-    /// segments, and the final rewrite adds `#EXT-X-ENDLIST`.
-    async fn publish_synthetic_low_playlist(&mut self) -> Result<(), TranscoderError> {
-        let low_dir = self.temp_root.join(QualityLevel::Low.name());
-        let segment_filenames = self.low_tier_uploaded_segment_filenames();
-        let playlist_body = synthesize_event_playlist(&segment_filenames);
-
-        let local_path = low_dir.join(PLAYLIST_FILENAME);
-        // Create the tier dir if hlssink2 raced us here. In practice it
-        // always exists by the time any segment has been uploaded, but
-        // belt-and-braces: the playlist write must not fail because of
-        // a missing parent.
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                TranscoderError::TranscodeFailed(format!("mkdir low dir: {e}"))
-            })?;
-        }
-        tokio::fs::write(&local_path, &playlist_body)
-            .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("write low playlist: {e}")))?;
-
-        self.upload_playlist_now(&local_path, QualityLevel::Low).await?;
-
-        // Stash the mtime we just wrote so the mtime-guarded path does
-        // not immediately re-upload the same bytes on the next tick.
-        // hlssink2's next write will change the mtime and trigger a
-        // real re-upload with more segments.
-        if let Some(mtime) = current_mtime(&local_path) {
-            self.state.playlist_mtimes.insert(local_path, mtime);
-        }
-        Ok(())
-    }
-
-    fn low_tier_uploaded_segment_filenames(&self) -> Vec<String> {
-        let low_dir = self.temp_root.join(QualityLevel::Low.name());
-        let mut names: Vec<String> = self
-            .state
-            .uploaded_segments
-            .iter()
-            .filter(|p| p.starts_with(&low_dir))
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
-            .collect();
-        names.sort();
-        names
-    }
-
-    async fn write_and_upload_master(&self) -> Result<(), TranscoderError> {
         let content = generate_master_playlist(&self.quality_levels, self.has_audio);
-        let master_path = self.temp_root.join(MASTER_FILENAME);
-
-        tokio::fs::write(&master_path, &content)
-            .await
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("write master: {e}")))?;
-
         let key = format!("{}{}", self.output_prefix, MASTER_FILENAME);
         self.storage
-            .upload_from_path(&master_path, &key, HLS_CONTENT_TYPE)
+            .upload_bytes(&key, content.as_bytes(), HLS_CONTENT_TYPE)
             .await
             .map_err(|e| TranscoderError::TranscodeFailed(format!("upload master: {e}")))?;
 
-        let _ = tokio::fs::remove_file(&master_path).await;
+        self.state.master_uploaded = true;
+        self.fire_notifier_once();
         Ok(())
     }
 
@@ -376,43 +354,25 @@ enum TickMode {
     /// writing by hlssink2.
     Running,
     /// Final tick after the pipeline has stopped. Uploads everything,
-    /// including the last segment of each tier and the final playlist
-    /// rewrite containing `#EXT-X-ENDLIST`.
+    /// including the last segment of each tier, and finalizes each
+    /// tier's playlist with `#EXT-X-ENDLIST`.
     FinalDrain,
 }
 
-/// Snapshot of a single tier's directory contents — separated out so
-/// [`HlsUploader::upload_tier`] doesn't have to juggle multiple return
-/// values from an inline read.
-struct TierScan {
-    segments: Vec<PathBuf>,
-    playlist: Option<PathBuf>,
-}
-
-fn scan_tier_dir(dir: &Path) -> Result<TierScan, TranscoderError> {
+/// List `*.ts` files in a tier directory, sorted by filename (which
+/// equals temporal order for hlssink2's `segment_%05d.ts` pattern).
+fn scan_segments(dir: &Path) -> Result<Vec<PathBuf>, TranscoderError> {
     let mut segments: Vec<PathBuf> = Vec::new();
-    let mut playlist: Option<PathBuf> = None;
-
     let entries = std::fs::read_dir(dir)
         .map_err(|e| TranscoderError::TranscodeFailed(format!("readdir {:?}: {e}", dir)))?;
-
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name == PLAYLIST_FILENAME {
-            playlist = Some(path);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(SEGMENT_EXTENSION) {
+        if path.extension().and_then(|e| e.to_str()) == Some(SEGMENT_EXTENSION) {
             segments.push(path);
         }
     }
-
-    // Filename order matches temporal order (segment_00000.ts,
-    // segment_00001.ts, ...) so sorting here gives us chronological
-    // upload order with no extra parsing.
     segments.sort();
-    Ok(TierScan { segments, playlist })
+    Ok(segments)
 }
 
 /// Pick which of the scanned segments are safe to upload this tick.
@@ -433,38 +393,34 @@ fn tier_object_key(output_prefix: &str, level: QualityLevel, filename: &str) -> 
     format!("{}{}/{}", output_prefix, level.name(), filename)
 }
 
-fn current_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Build a minimal HLS media playlist for the low tier listing
-/// `segment_filenames` as event-style. Used at early-publish time to
-/// guarantee a playable variant playlist is in storage before the
-/// viewer's player fetches it, even if hlssink2 hasn't yet flushed
-/// its own on-disk playlist.
+/// Build a minimal HLS media playlist listing `segment_filenames` in
+/// order. When `finalize` is false, the playlist is event-style
+/// (growing) so players continue polling for more segments; when
+/// true, `#EXT-X-ENDLIST` is appended so the player knows playback
+/// is complete and stops polling.
 ///
-/// Target duration is conservative at `SEGMENT_DURATION_SECS` (the
-/// encoder's target), and each segment is declared with an `#EXTINF`
-/// of the same duration. Player tolerances allow a small mismatch
-/// between the declared and actual segment durations; once hlssink2's
-/// real playlist replaces this one via the mtime-guarded path, the
-/// durations become exact.
-fn synthesize_event_playlist(segment_filenames: &[String]) -> String {
+/// `#EXT-X-TARGETDURATION` and each `#EXTINF` are set to the encoder's
+/// configured segment duration. Small discrepancies between the
+/// declared and actual durations are tolerated by both hls.js and
+/// native Safari HLS.
+pub(super) fn synthesize_variant_playlist(
+    segment_filenames: &[String],
+    finalize: bool,
+) -> String {
+    let target = super::gstreamer::SEGMENT_DURATION_SECS;
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:3\n");
-    playlist.push_str(&format!(
-        "#EXT-X-TARGETDURATION:{}\n",
-        super::gstreamer::SEGMENT_DURATION_SECS
-    ));
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-    playlist.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+    if !finalize {
+        playlist.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+    }
     for filename in segment_filenames {
-        playlist.push_str(&format!(
-            "#EXTINF:{}.000,\n{}\n",
-            super::gstreamer::SEGMENT_DURATION_SECS,
-            filename,
-        ));
+        playlist.push_str(&format!("#EXTINF:{}.000,\n{}\n", target, filename));
+    }
+    if finalize {
+        playlist.push_str("#EXT-X-ENDLIST\n");
     }
     playlist
 }
@@ -476,7 +432,7 @@ fn synthesize_event_playlist(segment_filenames: &[String]) -> String {
 /// per-tier playlist first to discover codecs). The codec string is
 /// stable across tiers because the pipeline pins H.264 to high
 /// profile, level 4.0 — see the `h264_caps` capsfilter in
-/// `gstreamer.rs::run_parallel_pipeline`.
+/// `gstreamer.rs::build_parallel_pipeline`.
 pub(super) fn generate_master_playlist(levels: &[QualityLevel], has_audio: bool) -> String {
     // avc1.640028 = High profile (64), no constraint flags (00),
     //               level 4.0 (28 hex = 40 dec).

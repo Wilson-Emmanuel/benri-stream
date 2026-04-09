@@ -46,7 +46,15 @@ impl Video {
     }
 
     pub fn is_streamable(&self) -> bool {
+        // Streamable once the master playlist is in storage. For a
+        // finalized video that's `Processed`. For an in-flight
+        // transcode, the early-publish path writes `share_token`
+        // *after* uploading `master.m3u8` and the first variant
+        // playlist, so a `Processing` video with a share token is
+        // also safe to hand to a player — hls.js will poll the EVENT
+        // playlist and pick up new segments as they land.
         matches!(self.status, VideoStatus::Processed)
+            || (matches!(self.status, VideoStatus::Processing) && self.share_token.is_some())
     }
 
     pub fn storage_prefix(&self) -> String {

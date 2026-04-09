@@ -159,6 +159,15 @@ fn only_processed_is_streamable() {
     assert!(!make_video(VideoStatus::Failed, None).is_streamable());
 }
 
+#[test]
+fn processing_with_share_token_is_streamable() {
+    // Early-publish path: the worker writes the master playlist and
+    // first variant playlist to storage, then sets the share token
+    // on the still-`Processing` row. At that point the video is
+    // streamable even though finalization hasn't run yet.
+    assert!(make_video(VideoStatus::Processing, Some("tok")).is_streamable());
+}
+
 // ---- Video::storage_prefix ----
 
 #[test]

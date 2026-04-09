@@ -22,6 +22,24 @@ pub struct AppConfig {
     pub cdn_base_url: String,
     pub redis_url: String,
     pub listen_addr: String,
+    /// Comma-separated list of HLS quality tiers the worker transcodes
+    /// for each video. Only the worker uses this — the api ignores it.
+    /// Defaults to the full `low,medium,high` ladder; dev environments
+    /// can override to `low` (or `low,medium`) to cut encode time
+    /// proportionally when running on CPU-only hosts. Unknown entries
+    /// are dropped and logged. See
+    /// `infrastructure::transcoder::quality::parse_quality_tiers`.
+    pub quality_tiers: String,
+    /// Maximum number of tasks the worker's consumer loop can have
+    /// in-flight at once. Only the worker uses this — the api ignores
+    /// it. Defaults to `1` (one task at a time, matching the pre-
+    /// semaphore behavior). Set higher on hosts with spare capacity
+    /// so that e.g. a second `ProcessVideo` can start transcoding
+    /// while the first one is still running. The ordering key on
+    /// `ProcessVideoTaskMetadata` already prevents two concurrent
+    /// attempts on the *same* video, so this knob is safe to raise
+    /// without adding per-video races.
+    pub worker_concurrency: usize,
 }
 
 impl AppConfig {
@@ -37,6 +55,13 @@ impl AppConfig {
             cdn_base_url: env_or("CDN_BASE_URL", "http://localhost:8888"),
             redis_url: env_or("REDIS_URL", "redis://localhost:6379"),
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:8080"),
+            quality_tiers: env_or("QUALITY_TIERS", "low,medium,high"),
+            worker_concurrency: env_or("WORKER_CONCURRENCY", "1")
+                .parse()
+                .unwrap_or_else(|_| {
+                    tracing::warn!("WORKER_CONCURRENCY not a valid integer; defaulting to 1");
+                    1
+                }),
         }
     }
 }

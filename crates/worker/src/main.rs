@@ -26,6 +26,7 @@ use infrastructure::postgres::video_repository::PostgresVideoRepository;
 use infrastructure::postgres::task_repository::PostgresTaskRepository;
 use infrastructure::storage::s3_client::S3StorageClient;
 use infrastructure::transcoder::gstreamer::GstreamerTranscoder;
+use infrastructure::transcoder::quality::parse_quality_tiers;
 use infrastructure::redis::task_publisher::RedisTaskPublisher;
 use infrastructure::redis::task_consumer::RedisTaskConsumer;
 use infrastructure::redis::distributed_lock::RedisDistributedLock;
@@ -75,8 +76,13 @@ async fn main() {
         Arc::new(PgTransactionPort::new(pool));
 
     // Transcoder
+    let quality_tiers = parse_quality_tiers(&config.quality_tiers);
+    tracing::info!(
+        tiers = ?quality_tiers.iter().map(|t| t.name()).collect::<Vec<_>>(),
+        "worker: transcoder quality ladder",
+    );
     let transcoder: Arc<dyn domain::ports::transcoder::TranscoderPort> =
-        Arc::new(GstreamerTranscoder::new(storage.clone()));
+        Arc::new(GstreamerTranscoder::new(storage.clone(), quality_tiers));
 
     // Use cases
     let process_video_uc = Arc::new(ProcessVideoUseCase::new(
@@ -122,8 +128,16 @@ async fn main() {
         Arc::new(RedisDistributedLock::new(redis_client.clone()));
 
     // Worker components
+    let worker_concurrency = config.worker_concurrency.max(1);
+    tracing::info!(
+        concurrency = worker_concurrency,
+        "worker: max concurrent tasks",
+    );
     let task_consumer = consumer::TaskConsumerLoop::new(
-        consumer_port, task_repo.clone(), handler,
+        consumer_port,
+        task_repo.clone(),
+        handler,
+        worker_concurrency,
     );
     let outbox_poller = poller::OutboxPoller::new(
         task_repo.clone(), publisher, lock.clone(),

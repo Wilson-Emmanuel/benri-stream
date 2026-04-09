@@ -216,6 +216,31 @@ impl StoragePort for S3StorageClient {
         Ok(())
     }
 
+    async fn upload_bytes(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), StorageError> {
+        tracing::info!(
+            key,
+            content_type,
+            size = bytes.len(),
+            "s3: uploading object from memory",
+        );
+        let body = aws_sdk_s3::primitives::ByteStream::from(bytes.to_vec());
+        self.client
+            .put_object()
+            .bucket(self.bucket_for(key))
+            .key(key)
+            .content_type(content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
         tracing::info!(key, "s3: deleting object");
         self.client
