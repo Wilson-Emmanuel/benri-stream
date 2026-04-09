@@ -275,13 +275,17 @@ impl HlsUploader {
 
         tracing::info!("publishing master playlist and firing share-link notifier");
 
-        // Force the current low variant playlist to storage at the
-        // same moment, so the player can resolve the first variant
-        // fetch. If the local file doesn't exist yet (hlssink2 hasn't
-        // flushed it), we log and carry on — the viewer's player
-        // will retry the variant fetch while the regular mtime path
-        // eventually uploads it a tick or two later.
-        self.upload_low_playlist_if_present().await?;
+        // Synthesize a minimal event-style low variant playlist that
+        // references exactly the segments we've already uploaded to
+        // storage, and upload it. We cannot trust hlssink2's on-disk
+        // playlist here — it is often empty or header-only at this
+        // moment because hlssink2 flushes its playlist file lazily
+        // (we've observed it only writing a complete playlist at
+        // tier-end). Uploading hlssink2's empty version would leave
+        // the player loading a playlist with zero segments, which
+        // renders as a 0:00 broken stream. Our synthesized version
+        // is always consistent with the segment set currently in S3.
+        self.publish_synthetic_low_playlist().await?;
 
         self.write_and_upload_master().await?;
         self.state.master_uploaded = true;
@@ -289,23 +293,55 @@ impl HlsUploader {
         Ok(())
     }
 
-    async fn upload_low_playlist_if_present(&mut self) -> Result<(), TranscoderError> {
-        let low_playlist = self
-            .temp_root
-            .join(QualityLevel::Low.name())
-            .join(PLAYLIST_FILENAME);
-        if !low_playlist.exists() {
-            tracing::warn!(
-                path = %low_playlist.display(),
-                "low/playlist.m3u8 not on disk yet at master publish; player may briefly 404",
-            );
-            return Ok(());
+    /// Write a minimal event-style playlist for the low tier listing
+    /// exactly the segments we've uploaded so far, and push it to
+    /// storage under `low/playlist.m3u8`. The `#EXT-X-PLAYLIST-TYPE:
+    /// EVENT` tag tells the player to keep polling for updates; each
+    /// subsequent hlssink2 playlist rewrite that reaches us via the
+    /// mtime-guarded path replaces this one with progressively more
+    /// segments, and the final rewrite adds `#EXT-X-ENDLIST`.
+    async fn publish_synthetic_low_playlist(&mut self) -> Result<(), TranscoderError> {
+        let low_dir = self.temp_root.join(QualityLevel::Low.name());
+        let segment_filenames = self.low_tier_uploaded_segment_filenames();
+        let playlist_body = synthesize_event_playlist(&segment_filenames);
+
+        let local_path = low_dir.join(PLAYLIST_FILENAME);
+        // Create the tier dir if hlssink2 raced us here. In practice it
+        // always exists by the time any segment has been uploaded, but
+        // belt-and-braces: the playlist write must not fail because of
+        // a missing parent.
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                TranscoderError::TranscodeFailed(format!("mkdir low dir: {e}"))
+            })?;
         }
-        self.upload_playlist_now(&low_playlist, QualityLevel::Low).await?;
-        if let Some(mtime) = current_mtime(&low_playlist) {
-            self.state.playlist_mtimes.insert(low_playlist, mtime);
+        tokio::fs::write(&local_path, &playlist_body)
+            .await
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("write low playlist: {e}")))?;
+
+        self.upload_playlist_now(&local_path, QualityLevel::Low).await?;
+
+        // Stash the mtime we just wrote so the mtime-guarded path does
+        // not immediately re-upload the same bytes on the next tick.
+        // hlssink2's next write will change the mtime and trigger a
+        // real re-upload with more segments.
+        if let Some(mtime) = current_mtime(&local_path) {
+            self.state.playlist_mtimes.insert(local_path, mtime);
         }
         Ok(())
+    }
+
+    fn low_tier_uploaded_segment_filenames(&self) -> Vec<String> {
+        let low_dir = self.temp_root.join(QualityLevel::Low.name());
+        let mut names: Vec<String> = self
+            .state
+            .uploaded_segments
+            .iter()
+            .filter(|p| p.starts_with(&low_dir))
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .collect();
+        names.sort();
+        names
     }
 
     async fn write_and_upload_master(&self) -> Result<(), TranscoderError> {
@@ -399,6 +435,38 @@ fn tier_object_key(output_prefix: &str, level: QualityLevel, filename: &str) -> 
 
 fn current_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Build a minimal HLS media playlist for the low tier listing
+/// `segment_filenames` as event-style. Used at early-publish time to
+/// guarantee a playable variant playlist is in storage before the
+/// viewer's player fetches it, even if hlssink2 hasn't yet flushed
+/// its own on-disk playlist.
+///
+/// Target duration is conservative at `SEGMENT_DURATION_SECS` (the
+/// encoder's target), and each segment is declared with an `#EXTINF`
+/// of the same duration. Player tolerances allow a small mismatch
+/// between the declared and actual segment durations; once hlssink2's
+/// real playlist replaces this one via the mtime-guarded path, the
+/// durations become exact.
+fn synthesize_event_playlist(segment_filenames: &[String]) -> String {
+    let mut playlist = String::new();
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        super::gstreamer::SEGMENT_DURATION_SECS
+    ));
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+    for filename in segment_filenames {
+        playlist.push_str(&format!(
+            "#EXTINF:{}.000,\n{}\n",
+            super::gstreamer::SEGMENT_DURATION_SECS,
+            filename,
+        ));
+    }
+    playlist
 }
 
 /// Build the HLS master playlist.

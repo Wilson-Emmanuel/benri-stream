@@ -13,7 +13,11 @@ use super::quality::QualityLevel;
 
 /// Target HLS segment duration in seconds. Shorter = faster time-to-stream,
 /// longer = fewer files and better CDN cache efficiency. 4s is the balance.
-const SEGMENT_DURATION_SECS: u32 = 4;
+///
+/// Visible to the sibling `hls_uploader` module so the synthesized early
+/// variant playlist can declare `EXT-X-TARGETDURATION` and `EXTINF` values
+/// that match what hlssink2 is producing.
+pub(super) const SEGMENT_DURATION_SECS: u32 = 4;
 
 /// Presigned-GET TTL for the input file. Sized to comfortably outlast
 /// the task's `processing_timeout` (30 min for `ProcessVideoTaskMetadata`),
