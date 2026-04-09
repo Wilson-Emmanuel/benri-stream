@@ -400,6 +400,23 @@ Workflow: **spec → implement → test**.
 
 ---
 
+## Known Limitations
+
+- **Early-publish playback in Safari and Chrome.** While a video is still
+  transcoding, the worker publishes a growing HLS `EVENT` playlist (no
+  `#EXT-X-ENDLIST` until finalize) so the share link is watchable
+  immediately. Firefox handles this correctly via `hls.js`: it plays
+  what's available, buffers when it hits the current edge, then resumes
+  as new segments land. Safari uses native HLS (bypassing `hls.js`
+  entirely) and treats the EVENT playlist as live — it stops at the
+  current edge instead of waiting for more segments. Chrome goes through
+  `hls.js` like Firefox but in testing has been inconsistent: it
+  sometimes shows a single thumbnail instead of starting playback. Both
+  browsers play the video correctly once finalize writes
+  `#EXT-X-ENDLIST`, so this only affects the early-publish window.
+
+---
+
 ## Running
 
 ### Prerequisites

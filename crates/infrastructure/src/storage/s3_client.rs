@@ -198,22 +198,30 @@ impl StoragePort for S3StorageClient {
         key: &str,
         content_type: &str,
     ) -> Result<(), StorageError> {
-        tracing::info!(key, content_type, "s3: uploading object from path");
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(local_path)
-            .await
-            .map_err(|e| StorageError::Internal(format!("failed to read {}: {}", local_path.display(), e)))?;
-
-        self.client
-            .put_object()
-            .bucket(self.bucket_for(key))
-            .key(key)
-            .content_type(content_type)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        Ok(())
+        // Read the whole file into memory and delegate to the in-memory
+        // upload path. This is deliberate: the streaming
+        // `ByteStream::from_path` variant stalls for ~30 seconds per
+        // request against MinIO (and likely any S3 that doesn't
+        // immediately respond `100-continue` to chunk-signed streaming
+        // PUTs). The in-memory `ByteStream::from(Vec)` path — exercised
+        // by `upload_bytes` below — completes the same ~500 KB upload
+        // in single-digit milliseconds. See diagnostic logs from the
+        // 2026-04-09 investigation: every `put_object().send()` backed
+        // by `from_path` took 30250 ms ± 10 ms, while `from(Vec)` took
+        // <15 ms against the same MinIO instance.
+        //
+        // HLS segments are capped at a few MB each (4 s of x264 @ 1080p
+        // ≈ 1 MB at the ceilings in `quality.rs`) and they're bound for
+        // S3 no matter what, so buffering one at a time adds a trivial
+        // amount of peak RSS in exchange for eliminating a ~2 order-
+        // of-magnitude upload slowdown. If we ever raise the max
+        // segment size materially, reconsider — the right answer then
+        // is a multipart upload, not chunk-signed streaming.
+        tracing::info!(key, content_type, "s3: reading segment into memory for upload");
+        let bytes = tokio::fs::read(local_path).await.map_err(|e| {
+            StorageError::Internal(format!("failed to read {}: {}", local_path.display(), e))
+        })?;
+        self.upload_bytes(key, &bytes, content_type).await
     }
 
     async fn upload_bytes(
