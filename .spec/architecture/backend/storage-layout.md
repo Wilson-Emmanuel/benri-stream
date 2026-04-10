@@ -48,3 +48,14 @@ Upload uses in-memory buffering (`tokio::fs::read` into `Vec<u8>`, then `ByteStr
 | `S3_ENDPOINT` | Custom endpoint for S3-compatible providers (MinIO, etc.) |
 | `S3_PUBLIC_ENDPOINT` | Endpoint for browser-facing presigned URLs (docker-compose) |
 | `CDN_BASE_URL` | Prefix for public URLs |
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Port trait | `crates/domain/src/ports/storage.rs` |
+| S3 implementation | `crates/infrastructure/src/storage/s3_client.rs` |
+| Bootstrap (client creation) | `crates/infrastructure/src/bootstrap.rs` |
+| New storage method | Add to `StoragePort` trait, implement in `S3StorageClient` |

@@ -53,3 +53,14 @@ Log errors closest to where they originate. Infrastructure logs the technical de
 | `task.processing_duration` | Histogram | `metadata_type`, `result` |
 
 The delta between `task.published` and `task.received` indicates queue depth and whether workers need to scale.
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Trace ID middleware | `crates/api/src/middleware.rs` |
+| Task-local context | `crates/domain/src/task/trace_context.rs` |
+| Tracing subscriber setup | `crates/api/src/main.rs`, `crates/worker/src/main.rs` |
+| Metrics recording | `crates/worker/src/consumer.rs` (task outcome counters) |

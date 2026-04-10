@@ -17,3 +17,14 @@ Every fallible operation returns `Result<T, E>`. Errors are explicitly handled o
 **Worker handlers** — map use case errors to task outcomes: business errors to permanent failure, `Internal` to retryable failure.
 
 **Panics** — reserved for programming bugs only. If it can happen in production, it's a `Result`.
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Port error types | `crates/domain/src/ports/error.rs` |
+| Use case errors | Nested `Error` enum in each use case file under `crates/application/src/usecases/` |
+| API error mapping | `crates/api/src/handlers/video.rs` (`impl From<Error> for ApiError`) |
+| New use case error | Define in the use case file, add `From` impl in the handler |

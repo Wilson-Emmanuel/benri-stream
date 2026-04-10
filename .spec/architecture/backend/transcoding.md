@@ -41,7 +41,8 @@ Variant playlists are synthesized from the uploaded-segment list (hlssink2's on-
 
 ## In-Memory Upload
 
-Segments are read into `Vec<u8>` then uploaded via `ByteStream::from`, not `ByteStream::from_path`. The streaming path stalls ~30s per request against MinIO. Segments are a few MB each, so the buffered path is both faster (<15ms) and simpler.
+Segments are read into `Vec<u8>` then uploaded via `ByteStream::from`, not `ByteStream::from_path`. The streaming path stalls ~30s per request against MinIO. 
+Segments are a few MB each, so the buffered path is both faster (<15ms) and simpler.
 
 ---
 
@@ -77,3 +78,17 @@ Quality tiers are an infrastructure detail — the domain port says "transcode t
 ## GPU Acceleration
 
 GStreamer auto-detects hardware encoders at runtime. Same pipeline code runs on GPU or falls back to CPU software encoding.
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Port traits | `crates/domain/src/ports/transcoder.rs` |
+| GStreamer implementation | `crates/infrastructure/src/transcoder/gstreamer.rs` |
+| HLS uploader | `crates/infrastructure/src/transcoder/hls_uploader.rs` |
+| Quality levels | `crates/infrastructure/src/transcoder/quality.rs` |
+| Task metadata | `crates/domain/src/task/metadata/process_video.rs` |
+| Use case | `crates/application/src/usecases/video/process_video.rs` |
+| Task handler | `crates/worker/src/handlers/process_video.rs` |

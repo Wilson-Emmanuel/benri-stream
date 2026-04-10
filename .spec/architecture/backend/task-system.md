@@ -108,3 +108,22 @@ The only duplicate window: handler succeeds, worker crashes before DB write, sta
 7. Document in `business-spec/task-system/task-catalog.md`
 
 No auto-discovery. Forgetting to register results in `PermanentFailure("No handler for ...")`.
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Task entity + traits | `crates/domain/src/task/` |
+| Task metadata types | `crates/domain/src/task/metadata/` |
+| Scheduler | `crates/domain/src/task/scheduler.rs` |
+| Trace context | `crates/domain/src/task/trace_context.rs` |
+| Postgres task repo | `crates/infrastructure/src/postgres/task_repository.rs` |
+| Redis publisher/consumer | `crates/infrastructure/src/redis/` |
+| Worker consumer loop | `crates/worker/src/consumer.rs` |
+| Handler dispatch | `crates/worker/src/handlers/mod.rs` |
+| Outbox poller | `crates/worker/src/poller.rs` |
+| Stale recovery | `crates/worker/src/recovery.rs` |
+| System task checker | `crates/worker/src/system_checker.rs` |
+| New task type | Add metadata in `domain/src/task/metadata/`, handler in `worker/src/handlers/`, register in dispatch map |

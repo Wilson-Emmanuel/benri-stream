@@ -24,3 +24,15 @@ Svelte SPA with two routes:
 2. `GET /api/videos/share/{shareToken}`
 3. If `streamUrl` present → initialize hls.js player
 4. If `streamUrl` null → poll until available
+
+---
+
+## File Locations
+
+| What | Where |
+|------|-------|
+| Upload page | `frontend/src/routes/+page.svelte` |
+| Player page | `frontend/src/routes/v/[shareToken]/+page.svelte` |
+| API client | `frontend/src/lib/api.js` |
+| HLS player config | Inside player page (`hls.js` import + config) |
+| New route | Add `frontend/src/routes/<path>/+page.svelte` |
