@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use crate::ports::error::RepositoryError;
 use crate::ports::task::TaskRepository;
 use crate::ports::transaction::TaskMutations;
+use super::trace_context;
 use super::{Task, TaskId, TaskMetadata, TaskStatus};
 
 /// Stateless entry point for creating tasks.
@@ -24,9 +25,12 @@ impl TaskScheduler {
     ///
     /// `run_at` defaults to `now` when `None`.
     ///
-    /// **trace_id**: not currently propagated. The Task is created with
-    /// `trace_id: None`. When OpenTelemetry / a tracing-context port is
-    /// wired, populate it here from the current span.
+    /// **trace_id** is picked up from the ambient
+    /// [`trace_context::current_trace_id`] so any task created inside
+    /// a `with_trace_id` scope inherits the caller's trace id. Outside
+    /// of a scope the value is `None` — identical to the pre-existing
+    /// behavior, which is why tests that don't opt in continue to work
+    /// unchanged.
     pub fn build_pending_task<M: TaskMetadata>(
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
@@ -41,7 +45,7 @@ impl TaskScheduler {
             metadata: metadata_json,
             status: TaskStatus::Pending,
             ordering_key: metadata.ordering_key(),
-            trace_id: None,
+            trace_id: trace_context::current_trace_id(),
             attempt_count: 0,
             next_run_at: run_at.unwrap_or(now),
             error: None,

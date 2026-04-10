@@ -11,6 +11,13 @@ uuid.workspace = true
 nanoid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Used only for `tokio::task_local!` in `task::trace_context`, which
+# carries the ambient trace id through the async call graph so the
+# scheduler can stamp it on newly-created task rows without every call
+# site plumbing the id as a parameter. Inherits the workspace's full
+# tokio feature set — we only need `task`, but the workspace pins
+# `features = ["full"]` and crates can't opt out.
+tokio.workspace = true
 
 # Optional — pulled in only when the `mock` feature is enabled.
 # Application tests turn this on via their dev-dependencies so

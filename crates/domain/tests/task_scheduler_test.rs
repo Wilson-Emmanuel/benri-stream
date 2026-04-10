@@ -79,3 +79,21 @@ fn build_pending_task_uses_explicit_run_at() {
     let task = TaskScheduler::build_pending_task(&BareMeta, Some(when)).unwrap();
     assert_eq!(task.next_run_at, when);
 }
+
+#[tokio::test]
+async fn build_pending_task_reads_trace_id_from_ambient_context() {
+    use domain::task::trace_context::with_trace_id;
+
+    // Outside the scope the scheduler should leave trace_id as None,
+    // matching the pre-existing behavior tests rely on.
+    let outside = TaskScheduler::build_pending_task(&BareMeta, None).unwrap();
+    assert!(outside.trace_id.is_none());
+
+    // Inside a scope the scheduler should stamp the ambient trace id
+    // onto the row without any call-site change.
+    let inside = with_trace_id(Some("trace-abc-123".to_string()), async {
+        TaskScheduler::build_pending_task(&BareMeta, None).unwrap()
+    })
+    .await;
+    assert_eq!(inside.trace_id.as_deref(), Some("trace-abc-123"));
+}

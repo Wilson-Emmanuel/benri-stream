@@ -1,6 +1,7 @@
 pub mod metadata;
 pub mod result;
 pub mod scheduler;
+pub mod trace_context;
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

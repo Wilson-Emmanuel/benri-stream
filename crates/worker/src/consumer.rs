@@ -7,6 +7,7 @@ use tracing::Instrument;
 
 use domain::ports::task::{TaskConsumer, TaskRepository};
 use domain::task::result::OutcomeKind;
+use domain::task::trace_context::with_trace_id;
 use domain::task::{Task, TaskId, TaskStatus};
 
 use crate::handlers::TaskHandlerInvoker;
@@ -159,11 +160,21 @@ impl TaskConsumerLoop {
 
         // Dispatcher owns timeout enforcement and compute_update — the
         // consumer just hands it the task and writes the resulting update.
+        //
+        // Wrap the dispatch in a `with_trace_id` scope so any sub-tasks
+        // the handler schedules (e.g. a follow-up job from
+        // `process_video`) inherit this task's trace_id via the
+        // scheduler's ambient read. Without this, only the top-level
+        // request's tasks would carry the id and the chain would break
+        // at every task boundary.
         let handler = handler.clone();
         let task_for_dispatch = task.clone();
-        let outcome = async move { handler.dispatch(&task_for_dispatch).await }
-            .instrument(span)
-            .await;
+        let trace_id = task.trace_id.clone();
+        let outcome = with_trace_id(
+            trace_id,
+            async move { handler.dispatch(&task_for_dispatch).await }.instrument(span),
+        )
+        .await;
 
         let metadata_type = task.metadata_type.clone();
         let outcome_kind = outcome.kind;
