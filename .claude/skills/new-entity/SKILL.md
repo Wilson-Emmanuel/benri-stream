@@ -5,7 +5,7 @@ argument-hint: <entity description>
 disable-model-invocation: true
 ---
 
-Read `.spec/business-spec/SPEC_GUIDE.md`.
+Read `.spec/SPEC_GUIDE.md`.
 
 New entity: $ARGUMENTS
 

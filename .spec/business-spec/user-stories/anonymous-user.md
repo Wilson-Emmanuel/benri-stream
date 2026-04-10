@@ -8,26 +8,16 @@
 
 ## 1. Upload and Share
 
-User has a product demo recording. They open benri-stream, drag in the file, give it a
-title, and upload. After a short wait, the shareable link appears. They copy it and
-share it.
+The user opens benri-stream, drags in a video file, gives it a title, and uploads. After a short wait, a shareable link appears. They copy it and send it.
 
 ---
 
 ## 2. Watching a Shared Video
 
-Someone taps the link on their phone during a commute. Video starts playing right away.
-Quality adjusts to their connection automatically — lower on mobile data, higher on wifi.
-Standard controls — pause, seek, fullscreen, irrespective of the uploaded file size.
+Someone opens the link. The video starts playing immediately with quality adapting to their connection. Standard controls: pause, seek, fullscreen.
 
 ---
 
 ## 3. Damaged or Unusable File
 
-User uploads a file that's damaged or that looks like a video but isn't decodable. The
-system probes it before transcoding. If the probe fails, or if transcoding errors out
-mid-stream, the video is marked failed and scheduled for deletion. No shareable link
-is generated. The user sees an error after uploading.
-
-Validation catches obviously bad files before upload (client-side type check, server-side
-magic-byte signature check) to reduce wasted work.
+The user uploads a file that is damaged or not decodable. The system probes it before transcoding; if the probe or transcode fails, the video is marked failed and scheduled for deletion. No shareable link is generated. Client-side type checks and server-side magic-byte validation catch obviously bad files before work begins.

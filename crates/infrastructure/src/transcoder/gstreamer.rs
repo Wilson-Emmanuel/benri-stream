@@ -15,8 +15,8 @@ use super::quality::QualityLevel;
 /// playlists declare matching `EXT-X-TARGETDURATION` and `EXTINF` values.
 pub(super) const SEGMENT_DURATION_SECS: u32 = 4;
 
-/// Presigned-GET TTL for the input file. Sized to outlast the maximum task
-/// `processing_timeout` (30 min) with plenty of headroom.
+/// Presigned-GET TTL for the input file. Matches the task
+/// `processing_timeout` (2 h).
 const INPUT_PRESIGN_TTL_SECS: u64 = 2 * 60 * 60;
 
 /// GStreamer-based transcoder. Reads from S3 via presigned URL, writes HLS

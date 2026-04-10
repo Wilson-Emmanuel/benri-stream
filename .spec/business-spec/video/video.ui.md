@@ -3,13 +3,6 @@
 > **Backend spec**: [video.md](video.md)
 > **User stories**: [anonymous-user.md](../user-stories/anonymous-user.md)
 
-## Changelog
-
-| Date | Change | Author |
-|------|--------|--------|
-| 2026-04-04 | Initial spec | Wilson |
-| 2026-04-09 | UI-VID-003 now resolves in 1–2 polls once the worker publishes the share link early (as soon as the low tier's first segment lands), not at the end of the full transcode. No interaction or screen changes — just faster on the wire. | Wilson |
-
 ---
 
 ## Screens
@@ -17,10 +10,8 @@
 ### Upload Page {#SCR-VID-001}
 
 **Route**: `/`
-**Entry points**:
-  - Direct visit
-**Layout**: Centered single column. Drop zone, title input, upload button. After upload
-completes, shows processing status and eventually the shareable link.
+**Entry points**: Direct visit
+**Layout**: Centered single column. Drop zone, title input, upload button. After upload completes, shows processing status and shareable link.
 **Interactions**: UI-VID-001, UI-VID-002, UI-VID-003, UI-VID-004
 
 ---
@@ -28,9 +19,8 @@ completes, shows processing status and eventually the shareable link.
 ### Player Page {#SCR-VID-002}
 
 **Route**: `/v/{shareToken}`
-**Entry points**:
-  - Shareable link (from upload page, shared via chat/email/etc.)
-**Layout**: Centered column. Video title above the player. Full-width video player below.
+**Entry points**: Shareable link
+**Layout**: Centered column. Video title above a full-width player.
 **Interactions**: UI-VID-005, UI-VID-006
 
 ---
@@ -46,24 +36,24 @@ completes, shows processing status and eventually the shareable link.
 **Behavior**
 1. Validate file type against supported formats
 2. Validate file size does not exceed 1 GB
-3. If valid, show filename and size in the drop zone. Pre-fill title input from filename (without extension)
-4. If invalid, show error message. Do not pre-fill title
+3. If valid: show filename and size, pre-fill title from filename (without extension)
+4. If invalid: show error, do not pre-fill title
 
-**Visual Feedback**
+**States**
 
-| Condition | Display |
-|-----------|---------|
-| Dragging over drop zone | Highlight border |
-| Valid file selected | Filename + size shown in drop zone |
-| Invalid type | "Unsupported format" error |
-| Invalid size | "File exceeds 1 GB" error |
+| State | Visual Behavior |
+|-------|----------------|
+| Dragging over | Highlight border |
+| Valid file | Filename + size in drop zone |
+| Invalid type | "Unsupported format" |
+| Invalid size | "File exceeds 1 GB" |
 
 ---
 
 ### Upload Video {#UI-VID-002}
 
 **Type**: Connected
-**Use Case**: [UC-VID-001](video.md#uc-vid-001) → [UC-VID-002](video.md#uc-vid-002)
+**Use Case**: [UC-VID-001](video.md#uc-vid-001) -> [UC-VID-002](video.md#uc-vid-002)
 **Triggered by**: User clicks Upload button
 **Screen**: [SCR-VID-001](#scr-vid-001)
 
@@ -72,15 +62,15 @@ completes, shows processing status and eventually the shareable link.
 | Field | Maps to UC Input | Widget | Client Validation |
 |-------|-----------------|--------|-------------------|
 | Title | `title` | Text input | Not blank, max 100 chars |
-| File | (uploaded via presigned URL) | Drop zone | Type + size (see UI-VID-001) |
+| File | (presigned URL) | Drop zone | Type + size (UI-VID-001) |
 
 **States**
 
 | State | Visual Behavior |
 |-------|----------------|
-| Uploading | Progress indicator. Upload button disabled |
-| Completing | "Finalizing..." text. Button disabled |
-| Error | Error message. Button re-enabled for retry |
+| Uploading | Progress indicator. Button disabled |
+| Completing | "Finalizing..." Button disabled |
+| Error | Error message. Button re-enabled |
 
 **Error Display**
 
@@ -89,7 +79,7 @@ completes, shows processing status and eventually the shareable link.
 | `UNSUPPORTED_FORMAT` | "This file format is not supported" |
 | `TITLE_REQUIRED` | "Please enter a title" |
 | `TITLE_TOO_LONG` | "Title is too long" |
-| `FILE_NOT_FOUND_IN_STORAGE` | "Upload failed — please try again" |
+| `FILE_NOT_FOUND_IN_STORAGE` | "Upload failed -- please try again" |
 | `FILE_TOO_LARGE` | "File exceeds 1 GB" |
 | `INVALID_FILE_SIGNATURE` | "This file doesn't appear to be a valid video" |
 
@@ -99,19 +89,14 @@ completes, shows processing status and eventually the shareable link.
 
 **Type**: Connected
 **Use Case**: [UC-VID-003](video.md#uc-vid-003)
-**Triggered by**: Automatically after upload completes (UI-VID-002 succeeds)
+**Triggered by**: Automatically after UI-VID-002 succeeds
 **Screen**: [SCR-VID-001](#scr-vid-001)
 
 **Behavior**
 1. Poll `GET /api/videos/{id}/status` every 5 seconds
-2. While `shareUrl` is null and status is not `FAILED` → show "Processing..."
-3. When `shareUrl` appears → stop polling, show the link (UI-VID-004).
-   Note: thanks to the worker's early-publish behavior
-   (see [UC-VID-005](video.md#uc-vid-005)), `shareUrl` typically appears
-   well before `status` transitions to `PROCESSED` — the link is valid
-   while the full transcode is still running. From the uploader's
-   perspective this is invisible: they just see the link appear.
-4. If status is `FAILED` → stop polling, show "This video could not be processed"
+2. While `shareUrl` is null and status is not `FAILED`: show "Processing..."
+3. When `shareUrl` appears: stop polling, show link (UI-VID-004). The link typically appears during `Processing` (before `PROCESSED`) due to early publish ([UC-VID-005](video.md#uc-vid-005)).
+4. If status is `FAILED`: stop polling, show error
 
 **States**
 
@@ -119,7 +104,7 @@ completes, shows processing status and eventually the shareable link.
 |-------|----------------|
 | Processing | "Processing..." with spinner |
 | Ready | Shareable link displayed |
-| Failed | Error message |
+| Failed | "This video could not be processed" |
 
 ---
 
@@ -130,8 +115,8 @@ completes, shows processing status and eventually the shareable link.
 **Screen**: [SCR-VID-001](#scr-vid-001)
 
 **Behavior**
-1. Copy the shareable URL to clipboard
-2. Brief visual confirmation ("Copied!")
+1. Copy URL to clipboard
+2. Brief "Copied!" confirmation
 
 ---
 
@@ -144,9 +129,9 @@ completes, shows processing status and eventually the shareable link.
 
 **Behavior**
 1. Fetch video metadata via `GET /api/videos/share/{shareToken}`
-2. If `streamUrl` is present → initialize HLS player
-3. If `streamUrl` is null → show title with "Processing..." and poll (UI-VID-006)
-4. Quality switching handled automatically by the HLS player — no UI controls needed
+2. If `streamUrl` present: initialize HLS player
+3. If `streamUrl` null: show title with "Processing..." and poll (UI-VID-006)
+4. Quality switching handled automatically by the HLS player
 
 **States**
 
@@ -173,4 +158,4 @@ completes, shows processing status and eventually the shareable link.
 
 **Behavior**
 1. Poll `GET /api/videos/share/{shareToken}` every 3 seconds
-2. When `streamUrl` appears → stop polling, initialize player (UI-VID-005)
+2. When `streamUrl` appears: stop polling, initialize player (UI-VID-005)

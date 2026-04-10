@@ -2,27 +2,25 @@
 
 Svelte SPA with two routes:
 
-| Route | Page | What it does |
-|-------|------|-------------|
-| `/` | Upload | File drop zone, title input, upload progress, polling for link |
-| `/v/{shareToken}` | Player | Fetches video metadata from API, plays HLS via hls.js |
+| Route | Page | Purpose |
+|-------|------|---------|
+| `/` | Upload | File drop, title input, upload progress, poll for share link |
+| `/v/{shareToken}` | Player | Fetch video metadata, play HLS via hls.js |
 
 ---
 
-## Upload Page Flow
+## Upload Flow
 
 1. User drops file → frontend validates (type, size, header check)
-2. Calls `POST /api/videos/initiate` → gets presigned URL + video ID
-3. Uploads directly to storage using presigned URL
-4. Calls `POST /api/videos/{id}/complete`
-5. Polls `GET /api/videos/{id}/status` until `shareUrl` appears
-6. Shows the shareable link
+2. `POST /api/videos/initiate` → presigned URL + video ID
+3. Upload directly to storage via presigned URL
+4. `POST /api/videos/{id}/complete`
+5. Poll `GET /api/videos/{id}/status` until `shareUrl` appears
+6. Display shareable link
 
----
+## Player Flow
 
-## Player Page Flow
-
-1. Extracts share token from URL
-2. Calls `GET /api/videos/share/{shareToken}`
-3. If `streamUrl` is present → initializes hls.js player
-4. If `streamUrl` is null → shows loading, polls until available
+1. Extract share token from URL
+2. `GET /api/videos/share/{shareToken}`
+3. If `streamUrl` present → initialize hls.js player
+4. If `streamUrl` null → poll until available

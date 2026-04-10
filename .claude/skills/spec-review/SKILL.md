@@ -5,7 +5,7 @@ argument-hint: <spec file or context name>
 allowed-tools: Read, Grep, Glob
 ---
 
-Read `.spec/business-spec/SPEC_GUIDE.md`, then the spec file(s) being reviewed.
+Read `.spec/SPEC_GUIDE.md`, then the spec file(s) being reviewed.
 
 Review target: $ARGUMENTS
 

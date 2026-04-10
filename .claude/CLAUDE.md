@@ -15,19 +15,19 @@ the relevant spec before writing code.
 
 ```
 .spec/
+  SPEC_GUIDE.md                   <- how to write and update specs
   architecture/
     system-architecture.md        <- system overview, stack, layers, patterns
     backend/
-      workspace-crates.md         <- crate structure, dependency rules, source layout, config
+      workspace-crates.md         <- crate structure, dependency rules, config
       data-store.md               <- schema, repositories, migrations
       storage-layout.md           <- S3 structure, presigned URLs
-      transcoding.md              <- pipeline, quality levels, GPU
+      transcoding.md              <- pipeline, quality levels, early publish
       task-system.md              <- task entity, lifecycle, worker design
       error-handling.md           <- error strategy per layer
       testing.md                  <- test strategy, test layout
-      observability.md            <- logging, tracing, metrics
+      observability.md            <- logging, trace ID, metrics
   business-spec/                  <- WHAT to build
-    SPEC_GUIDE.md                 <- how to write and update specs
     user-stories/
       anonymous-user.md
     video/
@@ -44,22 +44,14 @@ Do not deviate from the spec without updating it first.
 
 ## Non-Negotiable Rules
 
-For full architecture details, see the relevant `architecture/backend/` doc.
-
-1. **Dependency direction**: `api/worker` -> `application` -> `domain` <- `infrastructure`.
-   Application cannot import infrastructure -- compiler enforced via workspace crates.
-2. **All fallible operations return `Result`**. Never panic for expected failures.
-   `panic!` is only for programming bugs. See `backend/error-handling.md`.
+1. **Dependency direction**: `api/worker` -> `application` -> `domain` <- `infrastructure`. Compiler enforced.
+2. **All fallible operations return `Result`**. `panic!` only for programming bugs.
 3. **No business logic** in `infrastructure` or `presentation` layers.
 4. **Use cases never call other use cases.** Shared logic lives in application services.
 5. **All repository and port methods are `async`**.
-6. **Transactions are owned by use cases** -- never by infrastructure or presentation.
+6. **Transactions are owned by use cases** — never by infrastructure or presentation.
 7. **Error types are defined per use case**, not per entity.
-8. **Tasks are created via `TaskScheduler`** — either `schedule_in_tx`
-   inside a `TransactionPort::run` closure (when the schedule must be
-   atomic with a business mutation) or `schedule_standalone` on a
-   pool-backed repo (when there's no business mutation to bundle with).
-   See `backend/task-system.md`.
+8. **Tasks are created via `TaskScheduler`** — `schedule_in_tx` inside a transaction closure, or `schedule_standalone` on a pool-backed repo.
 
 ---
 
