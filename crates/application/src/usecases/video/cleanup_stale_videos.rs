@@ -7,7 +7,7 @@ use domain::ports::video::VideoRepository;
 use domain::task::metadata::delete_video::DeleteVideoTaskMetadata;
 use domain::task::scheduler::TaskScheduler;
 use domain::task::Task;
-use domain::video::{Video, VideoStatus};
+use domain::video::{Video, VideoId, VideoStatus};
 
 /// UC-VID-006 — Cleanup Stale Videos.
 ///
@@ -32,51 +32,30 @@ impl CleanupStaleVideosUseCase {
         tracing::info!("running stale video cleanup sweep");
 
         let now = Utc::now();
-        let stale_threshold = now - chrono::Duration::hours(24);
-        let failed_threshold = now - chrono::Duration::hours(24);
+        let threshold = now - chrono::Duration::hours(24);
 
         let stale = self
             .video_repo
-            .find_stale(stale_threshold)
+            .find_stale(threshold)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
         let failed = self
             .video_repo
-            .find_failed_before(failed_threshold)
+            .find_failed_before(threshold)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        let stuck_ids: Vec<_> = stale
-            .iter()
-            .filter(|v| {
-                matches!(v.status, VideoStatus::Uploaded | VideoStatus::Processing)
-            })
-            .map(|v| v.id.clone())
-            .collect();
+        let stuck_ids = collect_stuck_ids(&stale);
         if !stuck_ids.is_empty() {
             self.video_repo
-                .bulk_mark_failed(
-                    &stuck_ids,
-                    &[VideoStatus::Uploaded, VideoStatus::Processing],
-                )
+                .bulk_mark_failed(&stuck_ids, &[VideoStatus::Uploaded, VideoStatus::Processing])
                 .await
                 .map_err(|e| Error::Internal(e.to_string()))?;
         }
 
-        // build_pending_task keeps construction consistent with the single-task path.
-        let to_delete: Vec<&Video> = stale.iter().chain(failed.iter()).collect();
-        let tasks: Vec<Task> = to_delete
-            .iter()
-            .map(|v| {
-                TaskScheduler::build_pending_task(
-                    &DeleteVideoTaskMetadata { video_id: v.id.clone() },
-                    None,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
+        let tasks = build_delete_tasks(stale.iter().chain(failed.iter()))
             .map_err(|e| Error::Internal(e.to_string()))?;
-
         if !tasks.is_empty() {
             self.task_repo
                 .bulk_create(&tasks)
@@ -102,6 +81,31 @@ impl CleanupStaleVideosUseCase {
 
         Ok(stats)
     }
+}
+
+/// Returns the IDs of videos stuck in a transient state (`Uploaded` or `Processing`).
+fn collect_stuck_ids(videos: &[Video]) -> Vec<VideoId> {
+    videos
+        .iter()
+        .filter(|v| matches!(v.status, VideoStatus::Uploaded | VideoStatus::Processing))
+        .map(|v| v.id.clone())
+        .collect()
+}
+
+/// Builds a `DeleteVideo` pending task for each video in the iterator.
+///
+/// `build_pending_task` keeps construction consistent with the single-task path.
+fn build_delete_tasks<'a>(
+    videos: impl Iterator<Item = &'a Video>,
+) -> Result<Vec<Task>, domain::ports::error::RepositoryError> {
+    videos
+        .map(|v| {
+            TaskScheduler::build_pending_task(
+                &DeleteVideoTaskMetadata { video_id: v.id.clone() },
+                None,
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]

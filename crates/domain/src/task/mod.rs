@@ -76,133 +76,152 @@ impl Task {
         metadata: &M,
         result: &result::TaskResult,
     ) -> TaskRunOutcome {
-        use result::OutcomeKind;
+        use result::{OutcomeKind, TaskResult};
         let now = Utc::now();
         match result {
-            result::TaskResult::Success { reschedule_after, .. } => {
-                let next_run_at = reschedule_after
-                    .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64))
-                    .or_else(|| {
-                        metadata
-                            .execution_interval()
-                            .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64))
-                    });
-
-                let update = if let Some(next) = next_run_at {
-                    // Recurring task → reschedule.
-                    TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::Pending,
-                        attempt_count: 0,
-                        next_run_at: Some(next),
-                        error: None,
-                        completed_at: Some(now),
-                        updated_at: now,
-                    }
-                } else {
-                    // One-shot → completed.
-                    TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::Completed,
-                        attempt_count: self.attempt_count,
-                        next_run_at: None,
-                        error: None,
-                        completed_at: Some(now),
-                        updated_at: now,
-                    }
-                };
-                TaskRunOutcome { update, kind: OutcomeKind::Success }
+            TaskResult::Success { reschedule_after, .. } => {
+                self.on_success(metadata, *reschedule_after, now)
             }
-
-            result::TaskResult::RetryableFailure { error, retry_after } => {
-                let new_attempt = self.attempt_count + 1;
-                let can_retry = match metadata.max_retries() {
-                    Some(max) => self.attempt_count < max,
-                    None => false,
-                };
-
-                if !can_retry {
-                    let update = TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::DeadLetter,
-                        attempt_count: new_attempt,
-                        next_run_at: None,
-                        error: Some(error.clone()),
-                        completed_at: Some(now),
-                        updated_at: now,
-                    };
-                    TaskRunOutcome { update, kind: OutcomeKind::Failed }
-                } else {
-                    let delay = retry_after
-                        .map(|d| chrono::Duration::milliseconds(d.as_millis() as i64))
-                        .unwrap_or_else(|| calculate_retry_delay(metadata, self.attempt_count));
-                    let update = TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::Pending,
-                        attempt_count: new_attempt,
-                        next_run_at: Some(now + delay),
-                        error: Some(error.clone()),
-                        completed_at: None,
-                        updated_at: now,
-                    };
-                    TaskRunOutcome { update, kind: OutcomeKind::Retried }
-                }
+            TaskResult::RetryableFailure { error, retry_after } => {
+                self.on_retryable_failure(metadata, error, *retry_after, now)
             }
-
-            result::TaskResult::PermanentFailure { error } => {
-                let update = TaskUpdate {
-                    task_id: self.id.clone(),
-                    status: TaskStatus::DeadLetter,
-                    attempt_count: self.attempt_count,
-                    next_run_at: None,
-                    error: Some(error.clone()),
-                    completed_at: Some(now),
-                    updated_at: now,
-                };
-                TaskRunOutcome { update, kind: OutcomeKind::Failed }
+            TaskResult::PermanentFailure { error } => {
+                self.on_permanent_failure(error, now, OutcomeKind::Failed)
             }
-
-            result::TaskResult::Skip { reason } => {
-                // Recurring tasks reschedule on skip; one-shot → Completed.
-                let update = if let Some(interval) = metadata.execution_interval() {
-                    TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::Pending,
-                        attempt_count: self.attempt_count,
-                        next_run_at: Some(
-                            now + chrono::Duration::milliseconds(interval.as_millis() as i64),
-                        ),
-                        error: Some(format!("Skipped: {}", reason)),
-                        completed_at: None,
-                        updated_at: now,
-                    }
-                } else {
-                    TaskUpdate {
-                        task_id: self.id.clone(),
-                        status: TaskStatus::Completed,
-                        attempt_count: self.attempt_count,
-                        next_run_at: None,
-                        error: Some(format!("Skipped: {}", reason)),
-                        completed_at: Some(now),
-                        updated_at: now,
-                    }
-                };
-                TaskRunOutcome { update, kind: OutcomeKind::Success }
+            TaskResult::Skip { reason } => {
+                self.on_skip(metadata, reason, now)
             }
-
-            result::TaskResult::Terminate { reason } => {
-                let update = TaskUpdate {
-                    task_id: self.id.clone(),
-                    status: TaskStatus::Completed,
-                    attempt_count: self.attempt_count,
-                    next_run_at: None,
-                    error: Some(format!("Terminated: {}", reason)),
-                    completed_at: Some(now),
-                    updated_at: now,
-                };
-                TaskRunOutcome { update, kind: OutcomeKind::Success }
+            TaskResult::Terminate { reason } => {
+                self.on_terminate(reason, now)
             }
         }
+    }
+
+    fn on_success<M: TaskMetadata>(
+        &self,
+        metadata: &M,
+        reschedule_after: Option<std::time::Duration>,
+        now: DateTime<Utc>,
+    ) -> TaskRunOutcome {
+        let next_run_at = reschedule_after
+            .or_else(|| metadata.execution_interval())
+            .map(|d| now + chrono::Duration::milliseconds(d.as_millis() as i64));
+
+        let update = match next_run_at {
+            Some(next) => TaskUpdate {
+                // Recurring task → reschedule.
+                task_id: self.id.clone(),
+                status: TaskStatus::Pending,
+                attempt_count: 0,
+                next_run_at: Some(next),
+                error: None,
+                completed_at: Some(now),
+                updated_at: now,
+            },
+            None => TaskUpdate {
+                // One-shot → completed.
+                task_id: self.id.clone(),
+                status: TaskStatus::Completed,
+                attempt_count: self.attempt_count,
+                next_run_at: None,
+                error: None,
+                completed_at: Some(now),
+                updated_at: now,
+            },
+        };
+        TaskRunOutcome { update, kind: result::OutcomeKind::Success }
+    }
+
+    fn on_retryable_failure<M: TaskMetadata>(
+        &self,
+        metadata: &M,
+        error: &str,
+        retry_after: Option<std::time::Duration>,
+        now: DateTime<Utc>,
+    ) -> TaskRunOutcome {
+        let new_attempt = self.attempt_count + 1;
+        let can_retry = metadata.max_retries().map_or(false, |max| self.attempt_count < max);
+
+        if !can_retry {
+            return self.on_permanent_failure(error, now, result::OutcomeKind::Failed);
+        }
+
+        let delay = retry_after
+            .map(|d| chrono::Duration::milliseconds(d.as_millis() as i64))
+            .unwrap_or_else(|| calculate_retry_delay(metadata, self.attempt_count));
+        let update = TaskUpdate {
+            task_id: self.id.clone(),
+            status: TaskStatus::Pending,
+            attempt_count: new_attempt,
+            next_run_at: Some(now + delay),
+            error: Some(error.to_owned()),
+            completed_at: None,
+            updated_at: now,
+        };
+        TaskRunOutcome { update, kind: result::OutcomeKind::Retried }
+    }
+
+    fn on_permanent_failure(
+        &self,
+        error: &str,
+        now: DateTime<Utc>,
+        kind: result::OutcomeKind,
+    ) -> TaskRunOutcome {
+        let update = TaskUpdate {
+            task_id: self.id.clone(),
+            status: TaskStatus::DeadLetter,
+            attempt_count: self.attempt_count,
+            next_run_at: None,
+            error: Some(error.to_owned()),
+            completed_at: Some(now),
+            updated_at: now,
+        };
+        TaskRunOutcome { update, kind }
+    }
+
+    fn on_skip<M: TaskMetadata>(
+        &self,
+        metadata: &M,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> TaskRunOutcome {
+        // Recurring tasks reschedule on skip; one-shot → Completed.
+        let update = match metadata.execution_interval() {
+            Some(interval) => TaskUpdate {
+                task_id: self.id.clone(),
+                status: TaskStatus::Pending,
+                attempt_count: self.attempt_count,
+                next_run_at: Some(
+                    now + chrono::Duration::milliseconds(interval.as_millis() as i64),
+                ),
+                error: Some(format!("Skipped: {}", reason)),
+                completed_at: None,
+                updated_at: now,
+            },
+            None => TaskUpdate {
+                task_id: self.id.clone(),
+                status: TaskStatus::Completed,
+                attempt_count: self.attempt_count,
+                next_run_at: None,
+                error: Some(format!("Skipped: {}", reason)),
+                completed_at: Some(now),
+                updated_at: now,
+            },
+        };
+        TaskRunOutcome { update, kind: result::OutcomeKind::Success }
+    }
+
+    fn on_terminate(&self, reason: &str, now: DateTime<Utc>) -> TaskRunOutcome {
+        let update = TaskUpdate {
+            task_id: self.id.clone(),
+            status: TaskStatus::Completed,
+            attempt_count: self.attempt_count,
+            next_run_at: None,
+            error: Some(format!("Terminated: {}", reason)),
+            completed_at: Some(now),
+            updated_at: now,
+        };
+        TaskRunOutcome { update, kind: result::OutcomeKind::Success }
     }
 }
 

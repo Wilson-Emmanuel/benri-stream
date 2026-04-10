@@ -59,15 +59,12 @@ impl TaskConsumerLoop {
             // and dropped when it completes.
             let permit = tokio::select! {
                 _ = shutdown.changed() => continue,
-                res = self.concurrency.clone().acquire_owned() => {
-                    match res {
-                        Ok(p) => p,
-                        Err(_) => {
-                            // Semaphore closed — unreachable in normal operation.
-                            return;
-                        }
-                    }
-                }
+                res = self.concurrency.clone().acquire_owned() => res,
+            };
+            let permit = match permit {
+                Ok(p) => p,
+                // Semaphore closed — unreachable in normal operation.
+                Err(_) => return,
             };
 
             let pop_result = tokio::select! {
@@ -107,48 +104,12 @@ impl TaskConsumerLoop {
         handler: &Arc<dyn TaskHandlerInvoker>,
         task_id: &TaskId,
     ) {
-        let task: Arc<Task> = match task_repo.find_by_id(task_id).await {
-            Ok(Some(t)) => Arc::new(t),
-            Ok(None) => {
-                tracing::warn!(task_id = %task_id, "task not found in DB, skipping");
-                return;
-            }
-            Err(e) => {
-                tracing::error!(task_id = %task_id, error = %e, "failed to fetch task");
-                return;
-            }
+        let task = match Self::fetch_in_progress_task(task_repo, task_id).await {
+            Some(t) => t,
+            None => return,
         };
 
-        if task.status != TaskStatus::InProgress {
-            tracing::debug!(
-                task_id = %task_id,
-                status = ?task.status,
-                "task not IN_PROGRESS, skipping (already processed or reset)",
-            );
-            return;
-        }
-
-        let span = tracing::info_span!(
-            "task_handler",
-            task_id = %task.id,
-            metadata_type = %task.metadata_type,
-            attempt_count = task.attempt_count,
-            trace_id = tracing::field::Empty,
-        );
-        if let Some(ref tid) = task.trace_id {
-            span.record("trace_id", tracing::field::display(tid));
-        }
-
-        // Wrap dispatch in a `with_trace_id` scope so any tasks the handler
-        // schedules inherit this task's trace_id.
-        let handler = handler.clone();
-        let task_for_dispatch = task.clone();
-        let trace_id = task.trace_id.clone();
-        let outcome = with_trace_id(
-            trace_id,
-            async move { handler.dispatch(&task_for_dispatch).await }.instrument(span),
-        )
-        .await;
+        let outcome = Self::dispatch_with_trace(handler, &task).await;
 
         let metadata_type = task.metadata_type.clone();
         let outcome_kind = outcome.kind;
@@ -161,10 +122,71 @@ impl TaskConsumerLoop {
             );
         }
 
+        Self::record_metric(outcome_kind, metadata_type);
+    }
+
+    /// Fetches a task and returns it only when it is `InProgress`. Logs and
+    /// returns `None` for any other outcome so the caller can short-circuit.
+    async fn fetch_in_progress_task(
+        task_repo: &Arc<dyn TaskRepository>,
+        task_id: &TaskId,
+    ) -> Option<Arc<Task>> {
+        let task = match task_repo.find_by_id(task_id).await {
+            Ok(Some(t)) => Arc::new(t),
+            Ok(None) => {
+                tracing::warn!(task_id = %task_id, "task not found in DB, skipping");
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(task_id = %task_id, error = %e, "failed to fetch task");
+                return None;
+            }
+        };
+
+        if task.status != TaskStatus::InProgress {
+            tracing::debug!(
+                task_id = %task_id,
+                status = ?task.status,
+                "task not IN_PROGRESS, skipping (already processed or reset)",
+            );
+            return None;
+        }
+
+        Some(task)
+    }
+
+    /// Dispatches a task inside a tracing span and a `with_trace_id` scope so
+    /// any tasks the handler schedules inherit this task's trace id.
+    async fn dispatch_with_trace(
+        handler: &Arc<dyn TaskHandlerInvoker>,
+        task: &Arc<Task>,
+    ) -> domain::task::TaskRunOutcome {
+        let span = tracing::info_span!(
+            "task_handler",
+            task_id = %task.id,
+            metadata_type = %task.metadata_type,
+            attempt_count = task.attempt_count,
+            trace_id = tracing::field::Empty,
+        );
+        if let Some(ref tid) = task.trace_id {
+            span.record("trace_id", tracing::field::display(tid));
+        }
+
+        let handler = handler.clone();
+        let task_for_dispatch = task.clone();
+        with_trace_id(
+            task.trace_id.clone(),
+            async move { handler.dispatch(&task_for_dispatch).await }.instrument(span),
+        )
+        .await
+    }
+
+    /// Increments the appropriate task counter metric.
+    fn record_metric(kind: OutcomeKind, metadata_type: String) {
         // OutcomeKind is unambiguous for metrics: TaskStatus::Pending covers
         // both retries and successful recurring reschedules, but OutcomeKind
         // distinguishes them.
-        match outcome_kind {
+        match kind {
             OutcomeKind::Success => {
                 metrics::counter!("task.succeeded", "metadata_type" => metadata_type)
                     .increment(1);

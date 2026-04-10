@@ -60,16 +60,13 @@ impl<H: TypedTaskHandler + 'static> ErasedHandler for HandlerAdapter<H> {
     async fn invoke(&self, task: &Task) -> TaskRunOutcome {
         let metadata: H::Metadata = match serde_json::from_value(task.metadata.clone()) {
             Ok(m) => m,
+            // Unparseable metadata is a permanent failure; build the
+            // dead-letter outcome directly since there's no typed metadata
+            // to pass to compute_update.
             Err(e) => {
-                // Unparseable metadata is a permanent failure; build the
-                // dead-letter outcome directly since there's no typed metadata
-                // to pass to compute_update.
                 return dead_letter_outcome(
                     task,
-                    format!(
-                        "failed to deserialize metadata for {}: {}",
-                        task.metadata_type, e
-                    ),
+                    format!("failed to deserialize metadata for {}: {}", task.metadata_type, e),
                 );
             }
         };
@@ -79,23 +76,28 @@ impl<H: TypedTaskHandler + 'static> ErasedHandler for HandlerAdapter<H> {
             attempt_count: task.attempt_count,
         };
 
+        let result = self.run_with_timeout(&metadata, &ctx).await;
+        task.compute_update(&metadata, &result)
+    }
+}
+
+impl<H: TypedTaskHandler + 'static> HandlerAdapter<H> {
+    async fn run_with_timeout(
+        &self,
+        metadata: &H::Metadata,
+        ctx: &TaskExecutionContext,
+    ) -> TaskResult {
         let timeout = metadata.processing_timeout();
-        let result = match tokio::time::timeout(timeout, self.inner.handle(&metadata, &ctx)).await
-        {
-            Ok(r) => r,
+        match tokio::time::timeout(timeout, self.inner.handle(metadata, ctx)).await {
+            Ok(result) => result,
             Err(_elapsed) => {
-                tracing::error!(
-                    timeout_secs = timeout.as_secs(),
-                    "task handler timed out",
-                );
+                tracing::error!(timeout_secs = timeout.as_secs(), "task handler timed out");
                 TaskResult::RetryableFailure {
                     error: format!("handler timed out after {:?}", timeout),
                     retry_after: None,
                 }
             }
-        };
-
-        task.compute_update(&metadata, &result)
+        }
     }
 }
 

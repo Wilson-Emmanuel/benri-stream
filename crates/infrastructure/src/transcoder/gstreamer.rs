@@ -70,7 +70,6 @@ impl GstreamerTranscoder {
     ) -> Result<gstreamer::Pipeline, TranscoderError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
-        use gstreamer_video as gst_video;
 
         let pipeline = gst::Pipeline::new();
 
@@ -82,59 +81,12 @@ impl GstreamerTranscoder {
             .build()
             .map_err(|e| TranscoderError::TranscodeFailed(format!("uridecodebin3: {e}")))?;
 
-        // ---- Video front-end (always built) ----
-        let video_convert = gst::ElementFactory::make("videoconvert")
-            .build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("videoconvert: {e}")))?;
-        let video_tee = gst::ElementFactory::make("tee")
-            .build()
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("video tee: {e}")))?;
-
-        pipeline
-            .add_many([&src, &video_convert, &video_tee])
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("add video front-end: {e}")))?;
-        gst::Element::link_many([&video_convert, &video_tee])
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("link video front-end: {e}")))?;
+        let (video_convert, video_tee) = Self::build_video_frontend(&pipeline)?;
 
         // ---- Audio front-end (only if source has audio) ----
         // Encoded once and shared across all tiers via audio_tee.
         let audio_chain = if has_audio {
-            let audio_convert = gst::ElementFactory::make("audioconvert")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("audioconvert: {e}")))?;
-            let audio_resample = gst::ElementFactory::make("audioresample")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("audioresample: {e}")))?;
-            let audio_enc = gst::ElementFactory::make("avenc_aac")
-                .property("bitrate", 128_000i32)
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("avenc_aac: {e}")))?;
-            let audio_parse = gst::ElementFactory::make("aacparse")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("aacparse: {e}")))?;
-            let audio_tee = gst::ElementFactory::make("tee")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("audio tee: {e}")))?;
-
-            pipeline
-                .add_many([
-                    &audio_convert,
-                    &audio_resample,
-                    &audio_enc,
-                    &audio_parse,
-                    &audio_tee,
-                ])
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("add audio front-end: {e}")))?;
-            gst::Element::link_many([
-                &audio_convert,
-                &audio_resample,
-                &audio_enc,
-                &audio_parse,
-                &audio_tee,
-            ])
-            .map_err(|e| TranscoderError::TranscodeFailed(format!("link audio front-end: {e}")))?;
-
-            Some((audio_convert, audio_tee))
+            Some(Self::build_audio_frontend(&pipeline)?)
         } else {
             None
         };
@@ -147,33 +99,20 @@ impl GstreamerTranscoder {
         let audio_convert_weak = audio_chain.as_ref().map(|(ac, _)| ac.downgrade());
         src.connect_pad_added(move |_, pad| {
             let pad_name = pad.name();
-
             if pad_name.starts_with("video_") {
-                let Some(convert) = video_convert_weak.upgrade() else { return };
-                let Some(sink_pad) = convert.static_pad("sink") else { return };
-                if sink_pad.is_linked() {
-                    // Already linked — ignore additional video streams.
-                    return;
-                }
-                if let Err(e) = pad.link(&sink_pad) {
-                    tracing::error!(error = %e, "failed to link video pad to videoconvert");
-                }
+                Self::link_dynamic_pad(&pad, &video_convert_weak, "sink", "video pad to videoconvert");
             } else if pad_name.starts_with("audio_") {
-                let Some(weak) = &audio_convert_weak else {
-                    // No audio chain was built. Unusual, but possible if
-                    // streams differ between Discoverer and uridecodebin3.
-                    return;
-                };
-                let Some(convert) = weak.upgrade() else { return };
-                let Some(sink_pad) = convert.static_pad("sink") else { return };
-                if sink_pad.is_linked() {
-                    return;
+                if let Some(weak) = &audio_convert_weak {
+                    Self::link_dynamic_pad(&pad, weak, "sink", "audio pad to audioconvert");
                 }
-                if let Err(e) = pad.link(&sink_pad) {
-                    tracing::error!(error = %e, "failed to link audio pad to audioconvert");
-                }
+                // If no audio chain was built: unusual, but possible when
+                // streams differ between Discoverer and uridecodebin3.
             }
         });
+
+        pipeline
+            .add(&src)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add src: {e}")))?;
 
         // Build one encoder branch per quality level.
         for level in quality_levels {
@@ -181,138 +120,251 @@ impl GstreamerTranscoder {
             std::fs::create_dir_all(&level_dir)
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("mkdir: {e}")))?;
 
-            // ---- Video encoding branch ----
-            let vqueue = gst::ElementFactory::make("queue")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("vqueue: {e}")))?;
-            let vscale = gst::ElementFactory::make("videoscale")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("videoscale: {e}")))?;
+            let hlssink = Self::build_level_branch(&pipeline, &video_tee, level, &level_dir)?;
 
-            let (width, height) = level.resolution();
-            let vcaps = gst::ElementFactory::make("capsfilter")
-                .property(
-                    "caps",
-                    gst_video::VideoCapsBuilder::new()
-                        .width(width as i32)
-                        .height(height as i32)
-                        .build(),
-                )
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
-
-            let bitrate_kbps = level.target_bitrate_bps() / 1000;
-            // `ultrafast` trades compression ratio for encode speed (~3-5×
-            // faster than `fast`). Wall-time is the constraint when three
-            // tiers run in parallel on CPU. Bitrate ceilings in quality.rs
-            // bound output size regardless of preset.
-            let venc = gst::ElementFactory::make("x264enc")
-                .property("bitrate", bitrate_kbps)
-                .property_from_str("tune", "zerolatency")
-                .property_from_str("speed-preset", "ultrafast")
-                .property("key-int-max", SEGMENT_DURATION_SECS * 30)
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
-
-            // Pin H.264 to high profile, level 4.0 across all tiers so the
-            // master playlist can carry a stable CODECS= attribute and the
-            // player can pick a variant without fetching per-tier playlists.
-            let h264_caps = gst::ElementFactory::make("capsfilter")
-                .property(
-                    "caps",
-                    gst::Caps::builder("video/x-h264")
-                        .field("profile", "high")
-                        .field("level", "4")
-                        .build(),
-                )
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("h264 capsfilter: {e}")))?;
-
-            let vparse = gst::ElementFactory::make("h264parse")
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
-
-            // ---- Per-level HLS sink ----
-            // hlssink2 muxes to MPEG-TS internally; feed it parsed H.264
-            // (and AAC when present) via its `video` / `audio` request pads.
-            let playlist_path = level_dir.join("playlist.m3u8");
-            let segment_pattern = level_dir.join("segment_%05d.ts");
-            // max-files=0 disables hlssink2's segment rotation. The default
-            // (10) causes the concurrent uploader to occasionally read a
-            // segment that hlssink2 just deleted. We delete each segment
-            // ourselves once it's safely in S3, so disk usage stays bounded.
-            let hlssink = gst::ElementFactory::make("hlssink2")
-                .property("target-duration", SEGMENT_DURATION_SECS)
-                .property("playlist-length", 0u32)
-                .property("max-files", 0u32)
-                .property("playlist-location", playlist_path.to_str().unwrap())
-                .property("location", segment_pattern.to_str().unwrap())
-                .build()
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink2: {e}")))?;
-
-            pipeline
-                .add_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse, &hlssink])
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("add level branch: {e}")))?;
-
-            gst::Element::link_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse])
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("link video chain: {e}")))?;
-
-            // vparse → hlssink2.video (request pad)
-            let hls_video_sink = hlssink
-                .request_pad_simple("video")
-                .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 video pad".into()))?;
-            let vparse_src = vparse
-                .static_pad("src")
-                .ok_or_else(|| TranscoderError::TranscodeFailed("vparse src pad".into()))?;
-            vparse_src
-                .link(&hls_video_sink)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("link vparse→hlssink: {e}")))?;
-
-            // video_tee → vqueue
-            let video_tee_src = video_tee
-                .request_pad_simple("src_%u")
-                .ok_or_else(|| TranscoderError::TranscodeFailed("video tee src pad".into()))?;
-            let vqueue_sink = vqueue
-                .static_pad("sink")
-                .ok_or_else(|| TranscoderError::TranscodeFailed("vqueue sink pad".into()))?;
-            video_tee_src
-                .link(&vqueue_sink)
-                .map_err(|e| TranscoderError::TranscodeFailed(format!("link video tee: {e}")))?;
-
-            // ---- Per-level audio branch (only if source has audio) ----
             if let Some((_, audio_tee_elem)) = &audio_chain {
-                let aqueue = gst::ElementFactory::make("queue")
-                    .build()
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("aqueue: {e}")))?;
-                pipeline
-                    .add(&aqueue)
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("add aqueue: {e}")))?;
-
-                // audio_tee → aqueue
-                let audio_tee_src = audio_tee_elem
-                    .request_pad_simple("src_%u")
-                    .ok_or_else(|| TranscoderError::TranscodeFailed("audio tee src pad".into()))?;
-                let aqueue_sink = aqueue
-                    .static_pad("sink")
-                    .ok_or_else(|| TranscoderError::TranscodeFailed("aqueue sink pad".into()))?;
-                audio_tee_src
-                    .link(&aqueue_sink)
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("link audio tee: {e}")))?;
-
-                // aqueue → hlssink2.audio (request pad)
-                let hls_audio_sink = hlssink
-                    .request_pad_simple("audio")
-                    .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 audio pad".into()))?;
-                let aqueue_src = aqueue
-                    .static_pad("src")
-                    .ok_or_else(|| TranscoderError::TranscodeFailed("aqueue src pad".into()))?;
-                aqueue_src
-                    .link(&hls_audio_sink)
-                    .map_err(|e| TranscoderError::TranscodeFailed(format!("link aqueue→hlssink: {e}")))?;
+                Self::link_audio_branch(&pipeline, audio_tee_elem, &hlssink)?;
             }
         }
 
         Ok(pipeline)
+    }
+
+    /// Add videoconvert and video tee to the pipeline and link them.
+    fn build_video_frontend(
+        pipeline: &gstreamer::Pipeline,
+    ) -> Result<(gstreamer::Element, gstreamer::Element), TranscoderError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+
+        let video_convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("videoconvert: {e}")))?;
+        let video_tee = gst::ElementFactory::make("tee")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("video tee: {e}")))?;
+
+        pipeline
+            .add_many([&video_convert, &video_tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add video front-end: {e}")))?;
+        gst::Element::link_many([&video_convert, &video_tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link video front-end: {e}")))?;
+
+        Ok((video_convert, video_tee))
+    }
+
+    /// Add the shared audio chain (audioconvert → audioresample → avenc_aac →
+    /// aacparse → audio_tee) to the pipeline and link it. Returns
+    /// (audio_convert, audio_tee) — the two elements needed for dynamic pad
+    /// linking and per-level branch wiring.
+    fn build_audio_frontend(
+        pipeline: &gstreamer::Pipeline,
+    ) -> Result<(gstreamer::Element, gstreamer::Element), TranscoderError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+
+        let audio_convert = gst::ElementFactory::make("audioconvert")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("audioconvert: {e}")))?;
+        let audio_resample = gst::ElementFactory::make("audioresample")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("audioresample: {e}")))?;
+        let audio_enc = gst::ElementFactory::make("avenc_aac")
+            .property("bitrate", 128_000i32)
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("avenc_aac: {e}")))?;
+        let audio_parse = gst::ElementFactory::make("aacparse")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("aacparse: {e}")))?;
+        let audio_tee = gst::ElementFactory::make("tee")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("audio tee: {e}")))?;
+
+        pipeline
+            .add_many([&audio_convert, &audio_resample, &audio_enc, &audio_parse, &audio_tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add audio front-end: {e}")))?;
+        gst::Element::link_many([&audio_convert, &audio_resample, &audio_enc, &audio_parse, &audio_tee])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link audio front-end: {e}")))?;
+
+        Ok((audio_convert, audio_tee))
+    }
+
+    /// Attempt to link a dynamically-added source pad to the named sink pad of
+    /// `target`. Skips silently if the sink is already linked (duplicate stream).
+    fn link_dynamic_pad(
+        pad: &gstreamer::Pad,
+        target_weak: &gstreamer::glib::WeakRef<gstreamer::Element>,
+        sink_pad_name: &str,
+        label: &str,
+    ) {
+        use gstreamer::prelude::*;
+        let Some(target) = target_weak.upgrade() else { return };
+        let Some(sink_pad) = target.static_pad(sink_pad_name) else { return };
+        if sink_pad.is_linked() {
+            return;
+        }
+        if let Err(e) = pad.link(&sink_pad) {
+            tracing::error!(error = %e, "failed to link {label}");
+        }
+    }
+
+    /// Build the video encoder branch for one quality level, add it to the
+    /// pipeline, wire video_tee → vqueue, and return the hlssink2 element so
+    /// the caller can attach an audio branch if needed.
+    fn build_level_branch(
+        pipeline: &gstreamer::Pipeline,
+        video_tee: &gstreamer::Element,
+        level: &QualityLevel,
+        level_dir: &Path,
+    ) -> Result<gstreamer::Element, TranscoderError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use gstreamer_video as gst_video;
+
+        let vqueue = gst::ElementFactory::make("queue")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("vqueue: {e}")))?;
+        let vscale = gst::ElementFactory::make("videoscale")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("videoscale: {e}")))?;
+
+        let (width, height) = level.resolution();
+        let vcaps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst_video::VideoCapsBuilder::new()
+                    .width(width as i32)
+                    .height(height as i32)
+                    .build(),
+            )
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
+
+        let bitrate_kbps = level.target_bitrate_bps() / 1000;
+        // `ultrafast` trades compression ratio for encode speed (~3-5×
+        // faster than `fast`). Wall-time is the constraint when three
+        // tiers run in parallel on CPU. Bitrate ceilings in quality.rs
+        // bound output size regardless of preset.
+        let venc = gst::ElementFactory::make("x264enc")
+            .property("bitrate", bitrate_kbps)
+            .property_from_str("tune", "zerolatency")
+            .property_from_str("speed-preset", "ultrafast")
+            .property("key-int-max", SEGMENT_DURATION_SECS * 30)
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
+
+        // Pin H.264 to high profile, level 4.0 across all tiers so the
+        // master playlist can carry a stable CODECS= attribute and the
+        // player can pick a variant without fetching per-tier playlists.
+        let h264_caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-h264")
+                    .field("profile", "high")
+                    .field("level", "4")
+                    .build(),
+            )
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("h264 capsfilter: {e}")))?;
+
+        let vparse = gst::ElementFactory::make("h264parse")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
+
+        let hlssink = Self::make_hlssink(level_dir)?;
+
+        pipeline
+            .add_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse, &hlssink])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add level branch: {e}")))?;
+
+        gst::Element::link_many([&vqueue, &vscale, &vcaps, &venc, &h264_caps, &vparse])
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link video chain: {e}")))?;
+
+        // vparse → hlssink2.video (request pad)
+        let hls_video_sink = hlssink
+            .request_pad_simple("video")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 video pad".into()))?;
+        let vparse_src = vparse
+            .static_pad("src")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("vparse src pad".into()))?;
+        vparse_src
+            .link(&hls_video_sink)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link vparse→hlssink: {e}")))?;
+
+        // video_tee → vqueue
+        let video_tee_src = video_tee
+            .request_pad_simple("src_%u")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("video tee src pad".into()))?;
+        let vqueue_sink = vqueue
+            .static_pad("sink")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("vqueue sink pad".into()))?;
+        video_tee_src
+            .link(&vqueue_sink)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link video tee: {e}")))?;
+
+        Ok(hlssink)
+    }
+
+    /// Create and configure the hlssink2 element for a quality level directory.
+    ///
+    /// `max-files=0` disables hlssink2's segment rotation. The default (10)
+    /// causes the concurrent uploader to occasionally read a segment that
+    /// hlssink2 just deleted. We delete each segment ourselves once it's safely
+    /// in S3, so disk usage stays bounded.
+    fn make_hlssink(level_dir: &Path) -> Result<gstreamer::Element, TranscoderError> {
+        use gstreamer as gst;
+
+        let playlist_path = level_dir.join("playlist.m3u8");
+        let segment_pattern = level_dir.join("segment_%05d.ts");
+        gst::ElementFactory::make("hlssink2")
+            .property("target-duration", SEGMENT_DURATION_SECS)
+            .property("playlist-length", 0u32)
+            .property("max-files", 0u32)
+            .property("playlist-location", playlist_path.to_str().unwrap())
+            .property("location", segment_pattern.to_str().unwrap())
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("hlssink2: {e}")))
+    }
+
+    /// Wire audio_tee → aqueue → hlssink2.audio for one quality level.
+    fn link_audio_branch(
+        pipeline: &gstreamer::Pipeline,
+        audio_tee: &gstreamer::Element,
+        hlssink: &gstreamer::Element,
+    ) -> Result<(), TranscoderError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+
+        let aqueue = gst::ElementFactory::make("queue")
+            .build()
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("aqueue: {e}")))?;
+        pipeline
+            .add(&aqueue)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("add aqueue: {e}")))?;
+
+        // audio_tee → aqueue
+        let audio_tee_src = audio_tee
+            .request_pad_simple("src_%u")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("audio tee src pad".into()))?;
+        let aqueue_sink = aqueue
+            .static_pad("sink")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("aqueue sink pad".into()))?;
+        audio_tee_src
+            .link(&aqueue_sink)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link audio tee: {e}")))?;
+
+        // aqueue → hlssink2.audio (request pad)
+        let hls_audio_sink = hlssink
+            .request_pad_simple("audio")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("hlssink2 audio pad".into()))?;
+        let aqueue_src = aqueue
+            .static_pad("src")
+            .ok_or_else(|| TranscoderError::TranscodeFailed("aqueue src pad".into()))?;
+        aqueue_src
+            .link(&hls_audio_sink)
+            .map_err(|e| TranscoderError::TranscodeFailed(format!("link aqueue→hlssink: {e}")))?;
+
+        Ok(())
     }
 
     /// Drive a built pipeline to EOS or error, polling the bus in 500 ms

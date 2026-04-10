@@ -45,23 +45,16 @@ impl CompleteUploadUseCase {
             return Err(Error::AlreadyCompleted);
         }
 
-        let metadata = self
+        let object_meta = self
             .storage
             .head_object(&video.upload_key)
             .await
-            .map_err(|e| match e {
-                StorageError::NotFound(_) => Error::FileNotFoundInStorage,
-                other => Error::Internal(other.to_string()),
-            })?
+            .map_err(storage_err_to_use_case_err)?
             .ok_or(Error::FileNotFoundInStorage)?;
 
-        if metadata.size_bytes > MAX_UPLOAD_SIZE_BYTES {
-            schedule_delete_after_rejection(
-                self.task_repo.as_ref(),
-                &video.id,
-                "FileTooLarge",
-            )
-            .await;
+        if object_meta.size_bytes > MAX_UPLOAD_SIZE_BYTES {
+            schedule_delete_after_rejection(self.task_repo.as_ref(), &video.id, "FileTooLarge")
+                .await;
             return Err(Error::FileTooLarge);
         }
 
@@ -69,10 +62,7 @@ impl CompleteUploadUseCase {
             .storage
             .read_range(&video.upload_key, 0, FILE_SIGNATURE_READ_BYTES - 1)
             .await
-            .map_err(|e| match e {
-                StorageError::NotFound(_) => Error::FileNotFoundInStorage,
-                other => Error::Internal(other.to_string()),
-            })?;
+            .map_err(storage_err_to_use_case_err)?;
 
         if !video.format.validate_signature(&header_bytes) {
             schedule_delete_after_rejection(
@@ -84,22 +74,33 @@ impl CompleteUploadUseCase {
             return Err(Error::InvalidFileSignature);
         }
 
-        // Atomic status update + ProcessVideo scheduling in one tx.
-        // If the status update races another worker the whole tx rolls back,
-        // leaving no stale task behind.
-        //
+        let transitioned = self.transition_to_uploaded(&video.id).await?;
+        if !transitioned {
+            return Err(Error::AlreadyCompleted);
+        }
+
+        Ok(Output { id: video.id, status: VideoStatus::Uploaded })
+    }
+
+    /// Atomically transitions `PendingUpload → Uploaded` and schedules a
+    /// `ProcessVideo` task. Returns `false` if the row was already claimed.
+    async fn transition_to_uploaded(&self, video_id: &VideoId) -> Result<bool, Error> {
         // `transitioned` is Arc<AtomicBool> so the closure is `'static`
         // while the result is readable after the tx commits.
         let transitioned = Arc::new(AtomicBool::new(false));
         let transitioned_w = transitioned.clone();
-        let id_for_tx = video.id.clone();
+        let id_for_tx = video_id.clone();
 
         self.tx
             .run(Box::new(move |scope| {
                 Box::pin(async move {
                     let ok = scope
                         .videos()
-                        .update_status_if(&id_for_tx, VideoStatus::PendingUpload, VideoStatus::Uploaded)
+                        .update_status_if(
+                            &id_for_tx,
+                            VideoStatus::PendingUpload,
+                            VideoStatus::Uploaded,
+                        )
                         .await?;
                     transitioned_w.store(ok, Ordering::Relaxed);
                     if !ok {
@@ -118,14 +119,15 @@ impl CompleteUploadUseCase {
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        if !transitioned.load(Ordering::Relaxed) {
-            return Err(Error::AlreadyCompleted);
-        }
+        Ok(transitioned.load(Ordering::Relaxed))
+    }
+}
 
-        Ok(Output {
-            id: video.id,
-            status: VideoStatus::Uploaded,
-        })
+/// Maps a [`StorageError`] to the appropriate use-case error.
+fn storage_err_to_use_case_err(e: StorageError) -> Error {
+    match e {
+        StorageError::NotFound(_) => Error::FileNotFoundInStorage,
+        other => Error::Internal(other.to_string()),
     }
 }
 
