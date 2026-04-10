@@ -447,6 +447,24 @@ Subsequent runs are fast.
 
 Open http://localhost:5173 to use the app.
 
+### Worker tuning
+
+Two environment variables on the `worker` service in `docker-compose.yml` control
+transcoding behavior:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `QUALITY_TIERS` | `low,medium,high` | Comma-separated HLS quality tiers the worker produces per video (360p, 720p, 1080p). All tiers are encoded in parallel from a single decode pass. Override to `low` for faster iteration on CPU-only dev machines — cuts encode time ~3×. |
+| `WORKER_CONCURRENCY` | `3` | Max tasks a single worker processes simultaneously. Three matches the three quality tiers — each job fans out to one encoder per tier, so three concurrent jobs fully utilize a host with ~12 cores. The ordering key on `ProcessVideoTaskMetadata` prevents two concurrent attempts on the *same* video regardless of this setting, so raising it is safe. Lower to `1` on resource-constrained hosts. |
+
+Example: fast dev iteration on a laptop — single tier, one task at a time:
+
+```yaml
+environment:
+  QUALITY_TIERS: low
+  WORKER_CONCURRENCY: "1"
+```
+
 ### Stopping
 
 ```bash
