@@ -52,10 +52,7 @@ pub struct ErrorResponse {
     pub code: String,
 }
 
-/// Concrete error reply: status code + JSON body. Every handler maps
-/// its use case `Error` enum into this via the `From` impls below, and
-/// returns it through `Result<_, ApiError>`. `IntoResponse` lets Axum
-/// serialize it as the HTTP response.
+/// HTTP error reply carrying a status code and a structured JSON body.
 pub struct ApiError {
     status: StatusCode,
     body: ErrorResponse,
@@ -157,10 +154,8 @@ impl From<get_video_by_token::Error> for ApiError {
     }
 }
 
-/// Parse a path segment as a UUID, returning a JSON error response on
-/// failure. Used instead of `Path<Uuid>` so malformed UUIDs come back
-/// in the standard `ErrorResponse` shape rather than Axum's plain-text
-/// 400.
+/// Parses a path segment as a UUID, returning a structured JSON 400 instead
+/// of Axum's plain-text rejection.
 fn parse_uuid(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|_| {
         ApiError::new(

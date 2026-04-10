@@ -67,7 +67,6 @@ async fn main() {
     tracing::info!("worker: connecting to redis");
     let redis_client = create_redis_client(&config.redis_url).expect("Invalid Redis URL");
 
-    // Repositories + TransactionPort
     let video_repo: Arc<dyn domain::ports::video::VideoRepository> =
         Arc::new(PostgresVideoRepository::new(pool.clone()));
     let task_repo: Arc<dyn domain::ports::task::TaskRepository> =
@@ -75,7 +74,6 @@ async fn main() {
     let tx_port: Arc<dyn domain::ports::transaction::TransactionPort> =
         Arc::new(PgTransactionPort::new(pool));
 
-    // Transcoder
     let quality_tiers = parse_quality_tiers(&config.quality_tiers);
     tracing::info!(
         tiers = ?quality_tiers.iter().map(|t| t.name()).collect::<Vec<_>>(),
@@ -84,7 +82,6 @@ async fn main() {
     let transcoder: Arc<dyn domain::ports::transcoder::TranscoderPort> =
         Arc::new(GstreamerTranscoder::new(storage.clone(), quality_tiers));
 
-    // Use cases
     let process_video_uc = Arc::new(ProcessVideoUseCase::new(
         video_repo.clone(), tx_port.clone(), storage.clone(), transcoder,
     ));
@@ -95,9 +92,6 @@ async fn main() {
         video_repo.clone(), storage.clone(),
     ));
 
-    // Handler dispatch map — one entry per task type. The adapter
-    // deserializes the task's metadata Value into the concrete type before
-    // invoking the typed handler.
     let process_handler = Arc::new(ProcessVideoHandler::new(process_video_uc));
     let cleanup_handler = Arc::new(CleanupStaleHandler::new(cleanup_uc));
     let delete_handler = Arc::new(DeleteVideoHandler::new(delete_video_uc));
@@ -117,17 +111,14 @@ async fn main() {
     );
     let handler: Arc<dyn TaskHandlerInvoker> = Arc::new(HandlerDispatch::new(handler_map));
 
-    // Queue
     let publisher: Arc<dyn domain::ports::task::TaskPublisher> =
         Arc::new(RedisTaskPublisher::new(redis_client.clone()));
     let consumer_port: Arc<dyn domain::ports::task::TaskConsumer> =
         Arc::new(RedisTaskConsumer::new(redis_client.clone()));
 
-    // Distributed lock — single shared instance behind the port.
     let lock: Arc<dyn domain::ports::distributed_lock::DistributedLockPort> =
         Arc::new(RedisDistributedLock::new(redis_client.clone()));
 
-    // Worker components
     let worker_concurrency = config.worker_concurrency.max(1);
     tracing::info!(
         concurrency = worker_concurrency,
@@ -149,8 +140,6 @@ async fn main() {
         task_repo, lock,
     );
 
-    // Shutdown signal — all long-running components observe this and drain
-    // gracefully when the process is asked to stop.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tracing::info!("Worker started");
@@ -173,11 +162,6 @@ async fn main() {
         system_checker.run(checker_shutdown).await;
     });
 
-    // Wait for SIGINT / SIGTERM, then broadcast shutdown and wait for all
-    // components to drain. A second signal during the drain forces an
-    // immediate exit so an operator can kill a worker stuck inside a
-    // long-running handler (e.g. transcoding) without having to find
-    // the PID and SIGKILL it manually.
     wait_for_shutdown().await;
     tracing::info!("shutdown signal received, draining workers");
     let _ = shutdown_tx.send(true);
@@ -186,12 +170,7 @@ async fn main() {
     let (consumer_result, poller_result, recovery_result, checker_result) =
         tokio::join!(consumer_handle, poller_handle, recovery_handle, checker_handle);
 
-    // Surface any panics. tokio::spawn catches panics into the
-    // JoinHandle so the runtime stays alive, but ignoring these errors
-    // would let a panicked component die silently while the worker kept
-    // running with one fewer component. Logging here makes the failure
-    // visible at process exit time at minimum; a follow-up could add a
-    // supervisor that restarts failed components at runtime.
+    // Log panics so a silently dead component is visible at shutdown.
     log_join_result("consumer", consumer_result);
     log_join_result("poller", poller_result);
     log_join_result("recovery", recovery_result);
@@ -238,10 +217,9 @@ async fn wait_for_shutdown() {
     let _ = signal::ctrl_c().await;
 }
 
-/// After the first shutdown signal has triggered the graceful drain,
-/// install a background watcher that forces an immediate exit on the
-/// next signal. Standard exit code 130 (128 + SIGINT) so process
-/// supervisors recognize it as "killed by operator."
+/// Spawns a background task that force-exits on the second shutdown signal.
+/// Exit code 130 (128 + SIGINT) is recognized by process supervisors as an
+/// operator-initiated kill.
 fn spawn_force_exit_on_second_signal() {
     tokio::spawn(async move {
         wait_for_shutdown().await;

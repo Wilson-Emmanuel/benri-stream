@@ -9,23 +9,12 @@ use domain::task::scheduler::TaskScheduler;
 use domain::task::Task;
 use domain::video::{Video, VideoStatus};
 
-/// UC-VID-006 Cleanup Stale Videos — safety-net sweep.
+/// UC-VID-006 — Cleanup Stale Videos.
 ///
-/// Runs daily. Does NOT delete storage objects or rows directly — instead,
-/// enumerates qualifying videos and schedules a `DeleteVideo` task per
-/// video. All deletion goes through the single delete path (UC-VID-007).
-///
-/// The primary delete path is use cases scheduling `DeleteVideo` directly
-/// on rejection/failure (UC-VID-002, UC-VID-005). This sweep exists to
-/// catch videos that slipped through.
-///
-/// Two SQL statements per sweep:
-/// 1. Bulk-mark stuck UPLOADED/PROCESSING videos to FAILED.
-/// 2. Bulk-insert one DeleteVideo task per qualifying video (PENDING_UPLOAD,
-///    stuck UPLOADED/PROCESSING, old FAILED).
-///
-/// Multiple DeleteVideo tasks for the same video are safe — handler is
-/// idempotent (sees `VideoNotFound` after the first one runs and Skips).
+/// Daily safety-net sweep. Bulk-marks stuck `Uploaded`/`Processing` videos as
+/// `Failed`, then schedules a `DeleteVideo` task for every qualifying video
+/// (stale transient states + old `Failed` rows). All deletion goes through
+/// UC-VID-007. Duplicate tasks are safe — the handler is idempotent.
 pub struct CleanupStaleVideosUseCase {
     video_repo: Arc<dyn VideoRepository>,
     task_repo: Arc<dyn TaskRepository>,
@@ -46,21 +35,18 @@ impl CleanupStaleVideosUseCase {
         let stale_threshold = now - chrono::Duration::hours(24);
         let failed_threshold = now - chrono::Duration::hours(24);
 
-        // Stale transient states (PENDING_UPLOAD, UPLOADED, PROCESSING > 24h)
         let stale = self
             .video_repo
             .find_stale(stale_threshold)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // Old FAILED videos (> 24h)
         let failed = self
             .video_repo
             .find_failed_before(failed_threshold)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // Bulk transition stuck UPLOADED/PROCESSING → FAILED.
         let stuck_ids: Vec<_> = stale
             .iter()
             .filter(|v| {
@@ -78,10 +64,7 @@ impl CleanupStaleVideosUseCase {
                 .map_err(|e| Error::Internal(e.to_string()))?;
         }
 
-        // Build a DeleteVideo task per qualifying video and bulk-insert.
-        // We use TaskScheduler::build_pending_task so the construction
-        // logic is identical to the single-task `schedule()` path —
-        // no drift if the scheduler grows new fields (e.g. trace_id).
+        // build_pending_task keeps construction consistent with the single-task path.
         let to_delete: Vec<&Video> = stale.iter().chain(failed.iter()).collect();
         let tasks: Vec<Task> = to_delete
             .iter()

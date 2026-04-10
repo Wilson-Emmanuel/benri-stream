@@ -50,16 +50,10 @@ impl QualityLevel {
     }
 }
 
-/// Parse a comma-separated tier list (e.g. `"low,medium,high"` or
-/// `"low"`) into an ordered, de-duplicated `Vec<QualityLevel>`. Unknown
-/// entries are dropped and logged. An empty or all-unknown list
-/// resolves to the default full ladder so a misconfigured env var
-/// degrades gracefully rather than killing the worker.
-///
-/// Order of the input is preserved so the master playlist lists
-/// variants in the same order the operator specified; the viewer's
-/// player picks the first variant by default, so putting the cheapest
-/// tier first is usually what you want.
+/// Parse a comma-separated tier list (e.g. `"low,medium,high"`) into an
+/// ordered, deduplicated `Vec<QualityLevel>`. Unknown entries are dropped
+/// and logged. An empty or all-unknown list falls back to the full default
+/// ladder. Input order is preserved and reflected in the master playlist.
 pub fn parse_quality_tiers(raw: &str) -> Vec<QualityLevel> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();

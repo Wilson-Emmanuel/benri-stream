@@ -27,17 +27,9 @@ pub trait TranscoderPort: Send + Sync {
     ) -> Result<(), TranscoderError>;
 }
 
-/// One-shot signal fired by the transcoder the moment the master
-/// playlist and the low tier's first segment are both in storage. The
-/// caller passes a concrete impl (typically wrapping a `tokio::sync::
-/// oneshot::Sender`) to [`TranscoderPort::transcode_to_hls`].
-///
-/// Consumed by value (`self: Box<Self>`) to make the at-most-once
-/// contract type-enforced — calling `notify` more than once is not
-/// representable.
-///
-/// `Send + Sync` so implementations can be stored inside a struct that
-/// itself is held across `.await` points in a `tokio::spawn`'d task.
+/// One-shot signal fired when the master playlist and the low tier's first
+/// segment are both in storage. Consumed by value so the at-most-once
+/// contract is type-enforced.
 pub trait FirstSegmentNotifier: Send + Sync {
     fn notify(self: Box<Self>);
 }

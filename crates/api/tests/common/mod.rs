@@ -1,13 +1,8 @@
 #![allow(dead_code)]
 //! Integration-test harness for the api crate.
 //!
-//! Each test builds a fresh `Router` against a shared Postgres and
-//! MinIO container (via `infrastructure::testing`). No mocks — the full
-//! stack runs: HTTP → handler → use case → real repository → real DB /
-//! S3. This is the level at which routing, status codes, and error
-//! shape can only be verified end-to-end.
-//!
-//! Tests use unique `VideoId`s to stay independent inside a shared DB.
+//! Builds a real `Router` against Postgres and MinIO containers. Tests use
+//! unique `VideoId`s to stay independent inside the shared database.
 
 use std::sync::Arc;
 
@@ -32,16 +27,13 @@ use api::{build_router, AppState};
 pub const BASE_URL: &str = "http://test.local";
 pub const CDN_BASE_URL: &str = "http://cdn.test";
 
-/// Build a fresh `Router` wired to real Postgres + MinIO. Returns the
-/// router plus the pool and S3 client so tests can seed data directly
-/// without going through the HTTP surface.
+/// Builds a `Router` wired to real Postgres + MinIO. The returned `TestApp`
+/// exposes the pool and S3 client for direct test seeding.
 pub async fn build_test_app() -> TestApp {
     let pool = pg_pool().await;
     let s3 = minio_client().await;
     let ep = minio_endpoint().await;
 
-    // Tests point at a single MinIO container — no browser/backend
-    // split needed, so no upload_presign_client override.
     let storage: Arc<dyn domain::ports::storage::StoragePort> = Arc::new(S3StorageClient::new(
         s3.clone(),
         ep.upload_bucket.clone(),
@@ -95,9 +87,6 @@ pub struct TestApp {
 }
 
 impl TestApp {
-    /// Send a request through the router and collect the response into
-    /// a status + deserialized JSON body (or raw bytes for non-JSON
-    /// routes).
     pub async fn send(&self, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         let resp: Response<Body> = self
             .router
@@ -121,7 +110,6 @@ impl TestApp {
     }
 }
 
-/// Build a JSON POST request.
 pub fn json_post(path: &str, body: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -131,7 +119,6 @@ pub fn json_post(path: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
-/// Build a GET request.
 pub fn get(path: &str) -> Request<Body> {
     Request::builder()
         .method("GET")

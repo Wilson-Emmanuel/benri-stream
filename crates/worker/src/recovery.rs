@@ -10,13 +10,10 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const LOCK_KEY: &str = "benri:task:recovery:lock";
 const LOCK_TTL_SECS: u64 = 30;
 
-/// Periodically resets tasks that have been IN_PROGRESS for too long
-/// (worker crashed mid-handler, network split, etc.) back to PENDING.
-///
-/// The threshold is enforced inside `TaskRepository::reset_stale` as a
-/// fixed value (1 hour). Every task type's `processing_timeout` MUST stay
-/// well below that limit (current cap: 30 minutes) so a legitimately
-/// running handler is never reset.
+/// Periodically resets tasks stuck in IN_PROGRESS (crashed worker, network
+/// split, etc.) back to PENDING. The stale threshold is 1 hour; all task
+/// processing timeouts are capped well below that to avoid resetting live
+/// handlers.
 pub struct StaleRecovery {
     task_repo: Arc<dyn TaskRepository>,
     lock: Arc<dyn DistributedLockPort>,
@@ -60,10 +57,8 @@ impl StaleRecovery {
 
         let reset_result = self.task_repo.reset_stale().await.map_err(|e| e.to_string());
 
-        // If `reset_stale` panics, the lock release is skipped and the
-        // lock waits out its TTL (LOCK_TTL_SECS). Acceptable: stale
-        // recovery only runs once per RECOVERY_INTERVAL anyway, and
-        // another instance picks up on the next cycle.
+        // On panic the lock expires via its TTL; another instance picks up
+        // on the next cycle.
         let _ = self.lock.release(LOCK_KEY, &token).await;
 
         reset_result.map(|_| ())

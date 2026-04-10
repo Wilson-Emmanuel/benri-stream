@@ -31,12 +31,10 @@ impl std::fmt::Display for TaskId {
 
 /// A scheduled or in-flight task.
 ///
-/// **Scheduling config (max_retries, retry_base_delay, execution_interval,
-/// processing_timeout) is NOT stored on the row.** It lives on the typed
-/// `TaskMetadata` impl and is read at run time. The consumer's `HandlerAdapter`
-/// deserializes the metadata before computing the update so the live trait
-/// values are used. This means config changes apply immediately on the next
-/// task run without a migration.
+/// Scheduling config (`max_retries`, `retry_base_delay`, `execution_interval`,
+/// `processing_timeout`) is not stored on the row — it lives on the typed
+/// `TaskMetadata` impl and is read at run time, so config changes take effect
+/// immediately without a migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -57,13 +55,8 @@ pub struct Task {
 const MAX_RETRY_BACKOFF_SECS: i64 = 30 * 60;
 const MAX_BACKOFF_EXPONENT: i32 = 10;
 
-/// What a single task run produced: the DB row update plus the
-/// caller-facing summary of which `TaskResult` variant was hit (used
-/// for metric labeling).
-///
-/// `compute_update` produces both atomically so the metric label
-/// cannot drift from the actual outcome — there's a single match
-/// statement and each branch fixes both fields.
+/// DB row update plus outcome classification for metric labeling,
+/// produced together by `Task::compute_update`.
 #[derive(Debug, Clone)]
 pub struct TaskRunOutcome {
     pub update: TaskUpdate,
@@ -71,21 +64,13 @@ pub struct TaskRunOutcome {
 }
 
 impl Task {
-    /// Pure function: given the typed metadata and a `TaskResult`,
-    /// compute the next DB state and the outcome classification. No
-    /// side effects, no DB access.
+    /// Computes the next DB state and outcome classification from a `TaskResult`.
+    /// No side effects; the caller (typically `HandlerAdapter`) deserializes the
+    /// typed metadata and passes it in.
     ///
-    /// Generic over `M: TaskMetadata` because the per-task scheduling
-    /// config (max retries, base delay, interval) lives on the trait,
-    /// not on the row. The caller (typically `HandlerAdapter`) is
-    /// responsible for deserializing the typed metadata from
-    /// `task.metadata` and passing it.
-    ///
-    /// Note: `Skip` and `Terminate` outcomes write their reason into
-    /// the `error` column prefixed with `"Skipped: "` / `"Terminated: "`.
-    /// The `error` column doubles as a "last message" channel since
-    /// there's no dedicated last-message column. Filter on the prefix
-    /// when querying for actual failures.
+    /// `Skip` and `Terminate` write their reason into the `error` column prefixed
+    /// with `"Skipped: "` / `"Terminated: "` — filter on those prefixes when
+    /// querying for actual failures.
     pub fn compute_update<M: TaskMetadata>(
         &self,
         metadata: &M,
@@ -264,59 +249,50 @@ impl TaskStatus {
     }
 }
 
-/// Metadata for a specific task type. Implementations are data structs that
-/// declare the scheduling config for instances of that type.
+/// Scheduling configuration and routing for a task type.
 ///
-/// The `METADATA_TYPE` associated const (declared directly on the impl struct)
-/// should equal the struct name and match the key used when registering the
-/// handler in the dispatch map. `metadata_type_name()` returns that const.
+/// Each implementation is a data struct. `metadata_type_name()` must return
+/// the same string used to register the handler in the dispatch map.
 ///
-/// **Processing timeout limit**: each task type's `processing_timeout()` MUST
-/// be less than `STALE_RECOVERY_THRESHOLD - STALE_RECOVERY_BUFFER` so that
-/// stale recovery never resets a task that's still legitimately running. The
-/// current limit is 30 minutes (the global threshold is 1 hour).
+/// `processing_timeout()` must be less than 30 minutes so stale-recovery
+/// never resets a legitimately running task (the global stale threshold is
+/// 1 hour).
 pub trait TaskMetadata: Send + Sync + Serialize + DeserializeOwned {
-    /// Max time the consumer will wait for the handler before cancelling.
-    /// MUST be less than 30 minutes — see trait docstring.
+    /// Max time the consumer waits for the handler before cancelling.
+    /// Must be less than 30 minutes — see trait doc.
     fn processing_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
 
-    /// For recurring tasks, the delay between successful runs. `None` for
-    /// one-shot tasks.
+    /// Delay between successful runs for recurring tasks. `None` for one-shot tasks.
     fn execution_interval(&self) -> Option<Duration> {
         None
     }
 
-    /// Max retries on `RetryableFailure`. `None` = no retries (straight to
-    /// dead letter on first failure).
+    /// Max retries on `RetryableFailure`. `None` means no retries.
     fn max_retries(&self) -> Option<i32> {
         None
     }
 
-    /// Base for exponential backoff. Actual delay = `base * 2^attempt_count`,
-    /// capped at 30 minutes.
+    /// Base for exponential backoff (`base * 2^attempt_count`, capped at 30 minutes).
     fn retry_base_delay(&self) -> Duration {
         Duration::from_secs(30)
     }
 
-    /// Tasks with the same ordering key are processed sequentially (no two
-    /// active at once with the same key, enforced by `find_pending`'s CTE).
-    /// Used for resource serialization, not deduplication — handlers must
-    /// be idempotent because at-least-once delivery may invoke the same
-    /// handler twice.
+    /// Tasks with the same ordering key run sequentially — `find_pending`'s CTE
+    /// skips keys already in-progress. This serializes concurrent access to a
+    /// resource; it is not deduplication (handlers must still be idempotent).
     fn ordering_key(&self) -> Option<String> {
         None
     }
 
-    /// System tasks are recurring infrastructure tasks that the system task
-    /// checker recreates if no active instance exists.
+    /// Recurring infrastructure tasks that the system-task checker recreates
+    /// when no active instance exists.
     fn is_system_task(&self) -> bool {
         false
     }
 
-    /// Routing key used to match tasks to handlers. Must equal the struct's
-    /// `METADATA_TYPE` const.
+    /// Routing key used to match tasks to handlers.
     fn metadata_type_name(&self) -> &'static str;
 }
 

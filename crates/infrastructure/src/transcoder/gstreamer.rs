@@ -11,29 +11,18 @@ use tokio::sync::oneshot;
 use super::hls_uploader::HlsUploader;
 use super::quality::QualityLevel;
 
-/// Target HLS segment duration in seconds. Shorter = faster time-to-stream,
-/// longer = fewer files and better CDN cache efficiency. 4s is the balance.
-///
-/// Visible to the sibling `hls_uploader` module so the synthesized early
-/// variant playlist can declare `EXT-X-TARGETDURATION` and `EXTINF` values
-/// that match what hlssink2 is producing.
+/// Target HLS segment duration. Visible to `hls_uploader` so synthesized
+/// playlists declare matching `EXT-X-TARGETDURATION` and `EXTINF` values.
 pub(super) const SEGMENT_DURATION_SECS: u32 = 4;
 
-/// Presigned-GET TTL for the input file. Sized to comfortably outlast
-/// the task's `processing_timeout` (30 min for `ProcessVideoTaskMetadata`),
-/// since the task system cancels anything running longer than that.
+/// Presigned-GET TTL for the input file. Sized to outlast the maximum task
+/// `processing_timeout` (30 min) with plenty of headroom.
 const INPUT_PRESIGN_TTL_SECS: u64 = 2 * 60 * 60;
 
 /// GStreamer-based transcoder. Reads from S3 via presigned URL, writes HLS
-/// segments to a local temp dir, and uploads them to S3 *while the
-/// pipeline is still running* via a concurrent [`HlsUploader`] task.
-/// Workers are stateless — nothing persists between jobs.
-///
-/// `quality_tiers` is the ordered list of HLS quality tiers this
-/// transcoder produces for each video. Ordering is preserved into the
-/// master playlist (first entry is the player's default pick), so
-/// callers that want the cheapest tier to be the viewer's first hit
-/// should list it first.
+/// segments to a local temp dir, and uploads them concurrently via
+/// [`HlsUploader`] while the pipeline is running. Worker instances are
+/// stateless. `quality_tiers` order is preserved into the master playlist.
 pub struct GstreamerTranscoder {
     storage: Arc<dyn StoragePort>,
     quality_tiers: Vec<QualityLevel>,
@@ -44,13 +33,8 @@ impl GstreamerTranscoder {
         Self { storage, quality_tiers }
     }
 
-    /// Generate a time-limited presigned GET URL for reading the input
-    /// file from storage. Presigned URLs (rather than the public CDN
-    /// URL) keep `uploads/` private — only a worker holding a fresh
-    /// presign can read the original file.
-    ///
-    /// `INPUT_PRESIGN_TTL_SECS` is sized to outlast probe (seconds) and
-    /// the longest realistic transcode for a 1 GB source.
+    /// Presigned GET URL for the input file. Keeps `uploads/` private —
+    /// only a worker with a fresh presign can read the original.
     async fn input_url(&self, storage_key: &str) -> Result<String, TranscoderError> {
         self.storage
             .generate_presigned_download_url(storage_key, INPUT_PRESIGN_TTL_SECS)
@@ -60,34 +44,24 @@ impl GstreamerTranscoder {
             })
     }
 
-    /// Build and run a single HLS transcoding pipeline. The input is decoded
-    /// once and fanned out to one encoder branch per quality level. If the
-    /// source has an audio track, it's also decoded once, encoded once as
-    /// AAC, and shared across all quality levels (audio is identical across
-    /// tiers — no point re-encoding per tier).
+    /// Build the HLS pipeline. Input is decoded once and fanned out to one
+    /// encoder branch per quality level. Audio (if present) is encoded once
+    /// as AAC and shared across all tiers.
     ///
     /// ```text
     /// uridecodebin3 ─┬─ videoconvert → video_tee ─┬─ queue → scale(360p)  → x264enc → h264parse ─┐
     ///                │                            ├─ queue → scale(720p)  → x264enc → h264parse ─┤
     ///                │                            └─ queue → scale(1080p) → x264enc → h264parse ─┤
-    ///                │                                                                            ├──▶ hlssink2(per level, internal mpegtsmux)
+    ///                │                                                                            ├──▶ hlssink2(per level)
     ///                └─ audioconvert → audioresample → avenc_aac → aacparse → audio_tee ────────┘
-    ///                   (only built if the source has an audio stream)
+    ///                   (only when source has audio)
     /// ```
     ///
-    /// The `queue` element after each tee src pad puts the branch on its own
-    /// streaming thread — that's how the encoders actually run in parallel.
-    ///
-    /// `has_audio` is determined upstream by `probe()` and threaded in,
-    /// avoiding a second header read from S3.
-    ///
-    /// Returns the fully-linked pipeline ready for
-    /// [`Self::drive_pipeline_to_eos`]. The two steps are kept separate so the
-    /// caller can hold a shared `gst::Pipeline` handle and cancel the
-    /// running pipeline from outside — important because
-    /// `tokio::task::spawn_blocking` tasks are not cancellable through
-    /// their `JoinHandle`, so cancellation has to go through the
-    /// pipeline itself.
+    /// A `queue` after each tee src pad gives each encoder branch its own
+    /// streaming thread. Returns a linked pipeline ready for
+    /// [`Self::drive_pipeline_to_eos`]. The build/drive split lets the caller
+    /// hold the pipeline handle for out-of-band cancellation (spawn_blocking
+    /// tasks aren't cancellable via their JoinHandle).
     fn build_parallel_pipeline(
         input_url: &str,
         output_dir: &Path,
@@ -100,11 +74,9 @@ impl GstreamerTranscoder {
 
         let pipeline = gst::Pipeline::new();
 
-        // Source: uridecodebin3 is the modern, streams-aware decode
-        // element, stable since GStreamer 1.22 (this build targets 1.28).
-        // It has more accurate HTTP buffering than the older
-        // uridecodebin — relevant when reading from presigned S3 URLs
-        // where over-downloading costs real egress.
+        // uridecodebin3 is the streams-aware successor to uridecodebin,
+        // with more accurate HTTP buffering — relevant when reading from
+        // presigned S3 URLs where over-downloading incurs egress costs.
         let src = gst::ElementFactory::make("uridecodebin3")
             .property("uri", input_url)
             .build()
@@ -125,9 +97,7 @@ impl GstreamerTranscoder {
             .map_err(|e| TranscoderError::TranscodeFailed(format!("link video front-end: {e}")))?;
 
         // ---- Audio front-end (only if source has audio) ----
-        // Encoded once and fanned out to all levels via audio_tee — audio
-        // bitrate doesn't change across quality tiers, so re-encoding per
-        // tier would be pure waste.
+        // Encoded once and shared across all tiers via audio_tee.
         let audio_chain = if has_audio {
             let audio_convert = gst::ElementFactory::make("audioconvert")
                 .build()
@@ -169,15 +139,10 @@ impl GstreamerTranscoder {
             None
         };
 
-        // Dynamic pad linking: uridecodebin3 exposes decoded video/audio
-        // pads after stream discovery. Route each to the right front-end.
-        //
-        // We route by pad *name* (`video_%u` / `audio_%u`) rather than by
-        // caps because `uridecodebin3` exposes its source pads eagerly,
-        // before caps negotiation completes — `pad.current_caps()` is
-        // `None` at the moment `pad-added` fires. Pad names, by contrast,
-        // are part of `uridecodebin3`'s template and are always set, so
-        // they're a reliable type indicator at this point in the lifecycle.
+        // Dynamic pad linking: uridecodebin3 exposes pads after stream
+        // discovery. Route by pad name (`video_%u` / `audio_%u`) rather
+        // than caps — caps are not yet negotiated when `pad-added` fires,
+        // but pad names are part of the element template and always set.
         let video_convert_weak = video_convert.downgrade();
         let audio_convert_weak = audio_chain.as_ref().map(|(ac, _)| ac.downgrade());
         src.connect_pad_added(move |_, pad| {
@@ -195,9 +160,8 @@ impl GstreamerTranscoder {
                 }
             } else if pad_name.starts_with("audio_") {
                 let Some(weak) = &audio_convert_weak else {
-                    // We didn't build an audio chain (has_audio was false
-                    // during discovery). Unusual but possible if streams
-                    // changed between Discoverer and uridecodebin3.
+                    // No audio chain was built. Unusual, but possible if
+                    // streams differ between Discoverer and uridecodebin3.
                     return;
                 };
                 let Some(convert) = weak.upgrade() else { return };
@@ -238,13 +202,10 @@ impl GstreamerTranscoder {
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("capsfilter: {e}")))?;
 
             let bitrate_kbps = level.target_bitrate_bps() / 1000;
-            // `ultrafast` is the cheapest x264 preset — trades compression
-            // efficiency for encode speed, roughly 3-5× throughput vs
-            // `fast`. For this workload (three tiers encoding in parallel
-            // on CPU, often on laptop-grade Docker hosts) wall-time is the
-            // binding constraint, and the bitrate ceilings in the quality
-            // ladder already bound the output size. Revisit if/when
-            // hardware encoders become available (vtenc / nvenc / vaapi).
+            // `ultrafast` trades compression ratio for encode speed (~3-5×
+            // faster than `fast`). Wall-time is the constraint when three
+            // tiers run in parallel on CPU. Bitrate ceilings in quality.rs
+            // bound output size regardless of preset.
             let venc = gst::ElementFactory::make("x264enc")
                 .property("bitrate", bitrate_kbps)
                 .property_from_str("tune", "zerolatency")
@@ -253,12 +214,9 @@ impl GstreamerTranscoder {
                 .build()
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("x264enc: {e}")))?;
 
-            // Pin H.264 profile=high, level=4.0 across all tiers. This
-            // allows a stable CODECS="avc1.640028,..." attribute in the
-            // master playlist, so the player can pick a variant from the
-            // master alone instead of fetching every per-tier playlist
-            // first. High@4.0 fits every output here (max 1080p30,
-            // ≤25 Mbps).
+            // Pin H.264 to high profile, level 4.0 across all tiers so the
+            // master playlist can carry a stable CODECS= attribute and the
+            // player can pick a variant without fetching per-tier playlists.
             let h264_caps = gst::ElementFactory::make("capsfilter")
                 .property(
                     "caps",
@@ -275,22 +233,14 @@ impl GstreamerTranscoder {
                 .map_err(|e| TranscoderError::TranscodeFailed(format!("h264parse: {e}")))?;
 
             // ---- Per-level HLS sink ----
-            // hlssink2 muxes to MPEG-TS internally and exposes request
-            // pads named literally `video` and `audio`. We feed it the
-            // already-parsed H.264 (and AAC, when present) elementary
-            // streams directly — no external mpegtsmux needed.
+            // hlssink2 muxes to MPEG-TS internally; feed it parsed H.264
+            // (and AAC when present) via its `video` / `audio` request pads.
             let playlist_path = level_dir.join("playlist.m3u8");
             let segment_pattern = level_dir.join("segment_%05d.ts");
-            // `max-files = 0` means unlimited — do not let hlssink2
-            // rotate segment files off disk. The default is 10, which
-            // works for a classic live stream but breaks us: the
-            // concurrent uploader races against the rotation and
-            // occasionally tries to read a segment hlssink2 just
-            // deleted, producing an "IO error" that fails the whole
-            // transcode. We already remove each segment from the local
-            // temp dir the moment the uploader has it safely in S3, so
-            // disk usage is bounded by "segments produced but not yet
-            // uploaded" regardless of this setting.
+            // max-files=0 disables hlssink2's segment rotation. The default
+            // (10) causes the concurrent uploader to occasionally read a
+            // segment that hlssink2 just deleted. We delete each segment
+            // ourselves once it's safely in S3, so disk usage stays bounded.
             let hlssink = gst::ElementFactory::make("hlssink2")
                 .property("target-duration", SEGMENT_DURATION_SECS)
                 .property("playlist-length", 0u32)
@@ -365,18 +315,9 @@ impl GstreamerTranscoder {
         Ok(pipeline)
     }
 
-    /// Drive an already-built pipeline to EOS or error, polling the bus
-    /// on a short interval so the caller can cancel from outside by
-    /// flipping `cancel`.
-    ///
-    /// On normal EOS, returns `Ok(())`. On pipeline error, returns
-    /// `Err(TranscodeFailed(...))`. On cancellation (cancel flag set by
-    /// the caller), returns a specific "cancelled" error so the caller
-    /// can distinguish it from a "real" transcode failure if it wants to.
-    ///
-    /// Always sets the pipeline state back to `Null` before returning,
-    /// so resources are released deterministically even on the error
-    /// paths.
+    /// Drive a built pipeline to EOS or error, polling the bus in 500 ms
+    /// intervals. Returns `Ok(())` on EOS, `Err` on pipeline error or when
+    /// `cancel` is set. Always resets the pipeline to `Null` before returning.
     fn drive_pipeline_to_eos(
         pipeline: &gstreamer::Pipeline,
         cancel: &std::sync::atomic::AtomicBool,
@@ -435,7 +376,7 @@ impl TranscoderPort for GstreamerTranscoder {
 
         let url = self.input_url(storage_key).await?;
 
-        // Discoverer runs synchronously — use spawn_blocking to avoid blocking tokio
+        // Discoverer is synchronous — run on a blocking thread.
         tokio::task::spawn_blocking(move || {
             gst::init().map_err(|e| TranscoderError::ProbeFailed(format!("gst init: {e}")))?;
 
@@ -503,11 +444,9 @@ impl TranscoderPort for GstreamerTranscoder {
         let temp_path = temp_dir.path().to_path_buf();
         let quality_levels = self.quality_tiers.clone();
 
-        // Build the pipeline synchronously on the async task. Element
-        // construction and linking are cheap and non-blocking, and
-        // doing it here means we get a `gst::Pipeline` handle we can
-        // share with both the blocking driver and the async
-        // cancellation path below.
+        // Build synchronously: element construction is cheap and non-blocking,
+        // and building here gives a pipeline handle we can share with both the
+        // blocking driver and the cancellation path.
         let pipeline = Self::build_parallel_pipeline(
             &input_url,
             &temp_path,
@@ -515,13 +454,12 @@ impl TranscoderPort for GstreamerTranscoder {
             probe.has_audio,
         )?;
 
-        // Shared cancellation flag. The uploader-failure path sets it
-        // to `true`, and the blocking pipeline driver checks it between
-        // bus polls (every 500 ms) and exits promptly.
+        // Set to true by the uploader-failure path; the pipeline driver
+        // checks it between bus polls and exits within 500 ms.
         let cancel = Arc::new(AtomicBool::new(false));
 
-        // Kick off the uploader *before* the pipeline so it catches
-        // segments from the moment they're written.
+        // Start the uploader before the pipeline so it catches segments
+        // from the first write.
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let uploader = HlsUploader::new(
             temp_path.clone(),
@@ -533,54 +471,38 @@ impl TranscoderPort for GstreamerTranscoder {
         );
         let mut uploader_handle = tokio::spawn(uploader.run(stop_rx));
 
-        // Drive the pipeline to EOS on a blocking thread. We move a
-        // clone of the pipeline into the closure; the outer clone
-        // stays on the async task so we can cancel it.
+        // Drive the pipeline on a blocking thread. The outer clone stays
+        // on the async task for out-of-band cancellation.
         let mut pipeline_handle = tokio::task::spawn_blocking({
             let pipeline = pipeline.clone();
             let cancel = cancel.clone();
             move || Self::drive_pipeline_to_eos(&pipeline, &cancel)
         });
 
-        // Race the two. Whichever finishes first decides how the other
-        // winds down:
-        //
-        // - **Pipeline finishes first** (normal case): signal the
-        //   uploader to drain and await it. Any uploader error becomes
-        //   the transcode error.
-        // - **Uploader finishes first**: it only exits early on error.
-        //   Flip the cancel flag, wait for the pipeline driver to
-        //   notice and unwind (up to 500 ms + cleanup), and return the
-        //   uploader's error.
+        // Race pipeline and uploader. Pipeline finishing first is the normal
+        // case; uploader finishing first means it hit an error, so cancel
+        // the pipeline and surface the uploader's error.
         let final_result: Result<(), TranscoderError> = tokio::select! {
             pipeline_join = &mut pipeline_handle => {
-                // Normal path: pipeline finished (success or error).
                 let pipeline_result = pipeline_join.map_err(|e| {
                     TranscoderError::TranscodeFailed(format!("pipeline task join: {e}"))
                 })?;
-                // Signal the uploader to run its final drain. If the
-                // receiver is already gone (uploader errored out at
-                // the same instant) this is a harmless no-op.
+                // Signal the uploader to drain. No-op if it already exited.
                 let _ = stop_tx.send(());
                 let uploader_result = uploader_handle.await.map_err(|e| {
                     TranscoderError::TranscodeFailed(format!("uploader task join: {e}"))
                 })?;
-                // Pipeline error wins; otherwise propagate uploader error.
                 pipeline_result.and(uploader_result)
             }
             uploader_join = &mut uploader_handle => {
-                // Uploader exited before the pipeline — it only does
-                // that on error. Cancel the pipeline so it doesn't
-                // waste the next several minutes encoding into a
-                // doomed temp dir.
+                // Uploader exited early — must be an error. Cancel the
+                // pipeline so it doesn't continue encoding into a dead
+                // temp dir. Ignore the pipeline result; the uploader error
+                // is the real cause.
                 tracing::warn!(
                     "uploader exited before pipeline; cancelling pipeline to unwind transcode",
                 );
                 cancel.store(true, Ordering::Relaxed);
-                // Wait for the pipeline driver to notice and return.
-                // Ignore its result — the uploader error is the real
-                // cause, and we don't want a "cancelled" error to
-                // mask it.
                 let _ = pipeline_handle.await;
                 match uploader_join {
                     Ok(Ok(())) => Ok(()),
@@ -592,9 +514,7 @@ impl TranscoderPort for GstreamerTranscoder {
             }
         };
 
-        // Make sure the pipeline is in Null state no matter which path
-        // we took above — belt and braces for resource release before
-        // `temp_dir` drops and wipes the working directory.
+        // Belt-and-braces: ensure Null state before temp_dir drops.
         use gstreamer::prelude::*;
         let _ = pipeline.set_state(gst::State::Null);
 

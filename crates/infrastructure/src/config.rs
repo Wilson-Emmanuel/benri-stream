@@ -12,33 +12,21 @@ pub struct AppConfig {
     /// Inside docker-compose this is the container-network hostname
     /// (e.g. `http://minio:9000`).
     pub s3_endpoint: Option<String>,
-    /// Endpoint baked into presigned URLs returned to browsers. Must be
-    /// a hostname the browser can reach. Defaults to `s3_endpoint` when
-    /// unset — works for deployments where the API and the browser
-    /// share a network (e.g. running against real AWS S3), but must be
-    /// set explicitly for docker-compose, where the container-network
-    /// hostname is not browser-reachable.
+    /// Endpoint baked into presigned URLs returned to browsers. Defaults to
+    /// `s3_endpoint` when unset, which is correct for real AWS S3 and
+    /// single-network deployments. Must be set explicitly when the browser
+    /// cannot reach the internal container-network hostname (docker-compose).
     pub s3_public_endpoint: Option<String>,
     pub cdn_base_url: String,
     pub redis_url: String,
     pub listen_addr: String,
-    /// Comma-separated list of HLS quality tiers the worker transcodes
-    /// for each video. Only the worker uses this — the api ignores it.
-    /// Defaults to the full `low,medium,high` ladder; dev environments
-    /// can override to `low` (or `low,medium`) to cut encode time
-    /// proportionally when running on CPU-only hosts. Unknown entries
-    /// are dropped and logged. See
-    /// `infrastructure::transcoder::quality::parse_quality_tiers`.
+    /// Comma-separated HLS quality tiers the worker produces for each video.
+    /// Defaults to `low,medium,high`. Unknown entries are dropped and logged.
+    /// See `infrastructure::transcoder::quality::parse_quality_tiers`.
     pub quality_tiers: String,
-    /// Maximum number of tasks the worker's consumer loop can have
-    /// in-flight at once. Only the worker uses this — the api ignores
-    /// it. Defaults to `1` (one task at a time, matching the pre-
-    /// semaphore behavior). Set higher on hosts with spare capacity
-    /// so that e.g. a second `ProcessVideo` can start transcoding
-    /// while the first one is still running. The ordering key on
-    /// `ProcessVideoTaskMetadata` already prevents two concurrent
-    /// attempts on the *same* video, so this knob is safe to raise
-    /// without adding per-video races.
+    /// Maximum tasks the worker can have in-flight at once. Defaults to `1`.
+    /// The ordering key on `ProcessVideoTaskMetadata` prevents concurrent
+    /// attempts on the same video, so raising this is safe.
     pub worker_concurrency: usize,
 }
 

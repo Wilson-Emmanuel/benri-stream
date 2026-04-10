@@ -60,8 +60,6 @@ async fn get_by_token_returns_title_and_stream_url_for_processed() {
     let app = build_test_app().await;
     let repo = PostgresVideoRepository::new(app.pool.clone());
 
-    // Drive the video through PendingUpload → Uploaded → Processing →
-    // Processed with a short share token.
     let video = seed(VideoStatus::PendingUpload);
     repo.insert(&video).await.unwrap();
     repo.update_status_if(&video.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
@@ -94,18 +92,13 @@ async fn get_by_token_returns_404_for_missing_token() {
 
 #[tokio::test]
 async fn get_by_token_returns_null_stream_url_when_not_processed() {
-    // Short-circuit: insert a video with a share_token but status still
-    // transient. The response should carry the title and a null
-    // stream_url — confirms the use case honors is_streamable().
+    // The production path only assigns share_token on Processed, so this
+    // combination requires a raw SQL insert to set up.
     let app = build_test_app().await;
 
     let mut video = seed(VideoStatus::PendingUpload);
     let token: String = VideoId::new().0.simple().to_string().chars().take(21).collect();
     video.share_token = Some(token.clone());
-    // We can't insert directly with share_token + PendingUpload because
-    // the production path only assigns tokens on Processed. Use a raw
-    // SQL insert here — this test is deliberately checking a shape
-    // invariant, not a reachable state.
     sqlx::query(
         "INSERT INTO videos (id, share_token, title, format, status, upload_key, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",

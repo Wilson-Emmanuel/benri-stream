@@ -46,9 +46,7 @@ async fn put_then_head_then_read_range_then_delete_round_trip() {
     let key = format!("uploads/{}/data.bin", Uuid::new_v4());
     let body = b"hello-benri-stream-integration-test".to_vec();
 
-    // Put directly via the raw SDK (StoragePort doesn't expose a byte-
-    // slice put — `upload_from_path` requires a filesystem path which
-    // is fine but noisier than we need here).
+    // Put via the raw SDK — upload_from_path requires a filesystem path.
     raw.put_object()
         .bucket(&ep.upload_bucket)
         .key(&key)
@@ -77,7 +75,7 @@ async fn delete_prefix_removes_all_keys_under_the_prefix() {
     let raw = minio_client().await;
     let client = fresh_client().await;
 
-    // Use the `videos/` prefix so the adapter routes to the output bucket.
+    // Use videos/ prefix so the adapter routes to the output bucket.
     let root = format!("videos/{}", Uuid::new_v4());
     for name in ["master.m3u8", "v0/seg0.ts", "v1/seg0.ts"] {
         raw.put_object()
@@ -94,7 +92,7 @@ async fn delete_prefix_removes_all_keys_under_the_prefix() {
         .await
         .unwrap();
 
-    // All three gone.
+    // Verify all three are gone.
     for name in ["master.m3u8", "v0/seg0.ts", "v1/seg0.ts"] {
         assert!(client
             .head_object(&format!("{root}/{name}"))
@@ -113,8 +111,8 @@ async fn delete_prefix_on_empty_prefix_is_a_noop() {
 
 #[tokio::test]
 async fn routing_sends_uploads_and_videos_to_different_buckets() {
-    // Indirect check: put via the raw client to one bucket, head via
-    // the adapter which must route to the correct bucket by prefix.
+    // Put via the raw client into each bucket, then head via the adapter
+    // which must route to the correct bucket by prefix.
     let ep = minio_endpoint().await;
     let raw = minio_client().await;
     let client = fresh_client().await;

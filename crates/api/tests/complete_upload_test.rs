@@ -11,8 +11,7 @@ use domain::ports::video::VideoRepository;
 use domain::video::{Video, VideoFormat, VideoId, VideoStatus};
 use infrastructure::postgres::video_repository::PostgresVideoRepository;
 
-/// Insert a PendingUpload video row directly and put a body under its
-/// upload key so complete_upload has something to inspect.
+/// Inserts a PendingUpload video row and uploads a file body to its upload key.
 async fn seed_pending_upload(app: &TestApp, body: Vec<u8>) -> Video {
     let id = VideoId::new();
     let upload_key = format!("uploads/{}/original.mp4", id.0);
@@ -44,7 +43,7 @@ async fn seed_pending_upload(app: &TestApp, body: Vec<u8>) -> Video {
 }
 
 fn mp4_body() -> Vec<u8> {
-    // bytes[4..8] == "ftyp" is all validate_signature checks.
+    // validate_signature only checks bytes[4..8] == "ftyp".
     let mut b = vec![0u8; 64];
     b[4..8].copy_from_slice(b"ftyp");
     b
@@ -114,7 +113,6 @@ async fn second_complete_returns_409_already_completed() {
     let app = build_test_app().await;
     let video = seed_pending_upload(&app, mp4_body()).await;
 
-    // First call succeeds.
     let (first_status, _) = app
         .send(json_post(
             &format!("/api/videos/{}/complete", video.id.0),
@@ -123,7 +121,6 @@ async fn second_complete_returns_409_already_completed() {
         .await;
     assert_eq!(first_status, StatusCode::OK);
 
-    // Second call — status is now UPLOADED, not PENDING_UPLOAD.
     let (status, body) = app
         .send(json_post(
             &format!("/api/videos/{}/complete", video.id.0),

@@ -7,29 +7,20 @@ use std::time::Duration;
 
 use domain::ports::storage::{ObjectMetadata, PresignedUpload, StorageError, StoragePort};
 
-/// S3-compatible storage adapter routing by key prefix to one of two
+/// S3-compatible storage adapter that routes by key prefix to one of two
 /// buckets:
 ///
-/// - `uploads/...` → `upload_bucket` (private; only the worker reads
-///   originals via short-lived presigned GET URLs)
-/// - `videos/...`  → `output_bucket` (public-read via the CDN; HLS
-///   manifests and segments)
+/// - `uploads/...` → `upload_bucket` (private; worker reads via presigned GET)
+/// - `videos/...`  → `output_bucket` (public-read via CDN; HLS output)
 ///
-/// The split is enforced at the bucket level rather than via prefix
-/// policies on a single bucket so the public surface and the private
-/// surface have independent access controls, lifecycle rules, metrics,
-/// and storage classes. Domain code is unaware of the split — keys
-/// already carry their prefix, so the adapter routes transparently.
+/// The two-bucket split gives independent access controls and lifecycle rules
+/// for originals vs. public output. Domain code is unaware of the routing —
+/// keys already carry their prefix.
 pub struct S3StorageClient {
     client: Client,
-    /// Optional second client used only when signing the upload URL
-    /// returned to browsers. When `None`, `client` is used for all
-    /// operations — correct for real AWS S3 and for the worker, which
-    /// never presigns upload URLs for browsers. When `Some`, the
-    /// override is used only for `generate_presigned_upload_url` so
-    /// the signed `Host` header matches the browser-reachable endpoint
-    /// (docker-compose + MinIO case — the internal `minio:9000` host
-    /// is not browser-reachable).
+    /// When set, used instead of `client` for signing browser-facing upload
+    /// URLs. Required in docker-compose where the internal MinIO hostname is
+    /// not browser-reachable. `None` is correct for real AWS and the worker.
     upload_presign_client: Option<Client>,
     upload_bucket: String,
     output_bucket: String,
@@ -55,18 +46,14 @@ impl S3StorageClient {
         }
     }
 
-    /// Override the S3 client used for signing browser-facing upload
-    /// URLs. Only the api ever needs this — see the
-    /// `upload_presign_client` field docs for context.
+    /// Override the S3 client used to sign browser-facing upload URLs.
     pub fn with_upload_presign_client(mut self, client: Client) -> Self {
         self.upload_presign_client = Some(client);
         self
     }
 
-    /// Pick the right bucket for a given storage key. Panics on
-    /// unknown prefixes — every caller in the codebase produces keys
-    /// under `uploads/` or `videos/`, and an unknown prefix indicates
-    /// a programming bug, not a runtime condition.
+    /// Returns the bucket for the given key. Panics on unrecognized prefixes —
+    /// all callers produce `uploads/` or `videos/` keys by construction.
     fn bucket_for(&self, key: &str) -> &str {
         if key.starts_with(UPLOAD_PREFIX) {
             &self.upload_bucket
@@ -88,12 +75,10 @@ impl StoragePort for S3StorageClient {
         &self,
         key: &str,
         content_type: &str,
-        // Not enforced in the URL: AWS PUT presigning has no
-        // content-length-range condition (only POST policies do).
-        // Size is enforced server-side in `complete_upload` via
-        // `head_object` once the upload completes. The parameter is
-        // kept on the trait so a POST-policy implementation could
-        // enforce it at the storage layer without changing callers.
+        // AWS PUT presigning has no content-length-range condition (only POST
+        // policies do). Size is enforced server-side via `head_object` after
+        // upload. The parameter is on the trait so a POST-policy
+        // implementation can enforce it at the storage layer.
         _max_size_bytes: i64,
         expiry_secs: u64,
     ) -> Result<PresignedUpload, StorageError> {
@@ -102,9 +87,8 @@ impl StoragePort for S3StorageClient {
         let config = PresigningConfig::expires_in(Duration::from_secs(expiry_secs))
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Use the dedicated upload-presign client if configured so
-        // the URL's Host header matches a browser-reachable endpoint.
-        // Falls back to the main client when no override is set.
+        // Use the override client so the URL's Host header matches a
+        // browser-reachable endpoint; fall back to the main client otherwise.
         let signer = self.upload_presign_client.as_ref().unwrap_or(&self.client);
         let presigned = signer
             .put_object()
@@ -131,10 +115,8 @@ impl StoragePort for S3StorageClient {
         let config = PresigningConfig::expires_in(Duration::from_secs(expiry_secs))
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Always signed with the main client (never the
-        // browser-facing override): this URL is consumed by the
-        // worker's GStreamer pipeline inside the same docker network
-        // as MinIO, so the backend endpoint is correct here.
+        // Always use the main client — this URL is consumed by the worker's
+        // GStreamer pipeline, which is inside the same network as MinIO.
         let presigned = self
             .client
             .get_object()
@@ -198,25 +180,13 @@ impl StoragePort for S3StorageClient {
         key: &str,
         content_type: &str,
     ) -> Result<(), StorageError> {
-        // Read the whole file into memory and delegate to the in-memory
-        // upload path. This is deliberate: the streaming
-        // `ByteStream::from_path` variant stalls for ~30 seconds per
-        // request against MinIO (and likely any S3 that doesn't
-        // immediately respond `100-continue` to chunk-signed streaming
-        // PUTs). The in-memory `ByteStream::from(Vec)` path — exercised
-        // by `upload_bytes` below — completes the same ~500 KB upload
-        // in single-digit milliseconds. See diagnostic logs from the
-        // 2026-04-09 investigation: every `put_object().send()` backed
-        // by `from_path` took 30250 ms ± 10 ms, while `from(Vec)` took
-        // <15 ms against the same MinIO instance.
-        //
-        // HLS segments are capped at a few MB each (4 s of x264 @ 1080p
-        // ≈ 1 MB at the ceilings in `quality.rs`) and they're bound for
-        // S3 no matter what, so buffering one at a time adds a trivial
-        // amount of peak RSS in exchange for eliminating a ~2 order-
-        // of-magnitude upload slowdown. If we ever raise the max
-        // segment size materially, reconsider — the right answer then
-        // is a multipart upload, not chunk-signed streaming.
+        // Buffer the whole file and delegate to upload_bytes rather than
+        // using ByteStream::from_path. The streaming path stalls ~30 s per
+        // request against MinIO (any S3 that doesn't send `100-continue` for
+        // chunk-signed streaming PUTs), while the buffered path completes the
+        // same upload in <15 ms. HLS segments are a few MB each at most, so
+        // the RSS cost is negligible. If segment sizes grow significantly,
+        // multipart upload is the right answer — not streaming PUTs.
         tracing::info!(key, content_type, "s3: reading segment into memory for upload");
         let bytes = tokio::fs::read(local_path).await.map_err(|e| {
             StorageError::Internal(format!("failed to read {}: {}", local_path.display(), e))
@@ -272,10 +242,8 @@ impl StoragePort for S3StorageClient {
             }
             let output = req.send().await.map_err(|e| StorageError::Internal(e.to_string()))?;
 
-            // Batch-delete this page in one request instead of N
-            // delete_object calls. S3 list_objects_v2 returns ≤1000 keys
-            // per page and delete_objects accepts ≤1000 keys per request,
-            // so one page = one delete request.
+            // list_objects_v2 returns ≤1000 keys per page; delete_objects
+            // accepts ≤1000 keys per call — one page maps to one delete.
             let to_delete: Vec<ObjectIdentifier> = output
                 .contents()
                 .iter()

@@ -33,7 +33,7 @@ async fn commit_persists_both_mutations_atomically() {
     let task_repo = PostgresTaskRepository::new(pool.clone());
     let tx = PgTransactionPort::new(pool.clone());
 
-    // Seed: a PendingUpload video.
+    // Seed a PendingUpload video.
     let video = uploaded_video();
     video_repo.insert(&video).await.unwrap();
 
@@ -57,11 +57,9 @@ async fn commit_persists_both_mutations_atomically() {
     .await
     .unwrap();
 
-    // Video is now Uploaded.
     let after = video_repo.find_by_id(&video.id).await.unwrap().unwrap();
     assert_eq!(after.status, VideoStatus::Uploaded);
 
-    // Exactly one matching ProcessVideo task exists (for this video).
     let count = task_repo
         .count_active_by_type("ProcessVideoTaskMetadata")
         .await
@@ -92,7 +90,7 @@ async fn rollback_on_error_reverts_both_mutations() {
                     None,
                 )
                 .await?;
-                // Abort — both mutations should roll back.
+                // Abort — both mutations must roll back.
                 Err(RepositoryError::Database("simulated abort".into()))
             })
         }))
@@ -100,11 +98,7 @@ async fn rollback_on_error_reverts_both_mutations() {
     assert!(result.is_err());
 
     let after = video_repo.find_by_id(&video.id).await.unwrap().unwrap();
-    assert_eq!(
-        after.status,
-        VideoStatus::PendingUpload,
-        "video status must roll back to its pre-tx value",
-    );
+    assert_eq!(after.status, VideoStatus::PendingUpload);
 }
 
 #[tokio::test]
@@ -118,16 +112,13 @@ async fn rollback_when_claim_races_does_not_leave_orphan_task() {
 
     let video = uploaded_video();
     video_repo.insert(&video).await.unwrap();
-    // Race: push the video to Uploaded before the tx runs.
+    // Push the video out of PendingUpload before the tx runs.
     video_repo
         .update_status_if(&video.id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
         .await
         .unwrap();
 
     let id = video.id.clone();
-    // This models the complete_upload path: if the conditional update
-    // reports "no row updated", the closure returns Err and the whole
-    // tx (including any task it scheduled) rolls back.
     let count_before = task_repo
         .count_active_by_type("ProcessVideoTaskMetadata")
         .await
@@ -140,9 +131,8 @@ async fn rollback_when_claim_races_does_not_leave_orphan_task() {
                     .videos()
                     .update_status_if(&id, VideoStatus::PendingUpload, VideoStatus::Uploaded)
                     .await?;
-                // Schedule first, then decide whether to abort — this
-                // mirrors the worst case where the task insert lands
-                // before the rollback.
+                // Schedule before checking the claim result — tests the
+                // worst case where the insert lands before the rollback.
                 TaskScheduler::schedule_in_tx(
                     scope.tasks(),
                     &ProcessVideoTaskMetadata { video_id: id.clone() },
@@ -162,8 +152,5 @@ async fn rollback_when_claim_races_does_not_leave_orphan_task() {
         .count_active_by_type("ProcessVideoTaskMetadata")
         .await
         .unwrap();
-    assert_eq!(
-        count_after, count_before,
-        "aborted tx must not leave the scheduled task behind",
-    );
+    assert_eq!(count_after, count_before);
 }

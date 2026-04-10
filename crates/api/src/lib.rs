@@ -50,21 +50,14 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::video::get_video_by_token),
         )
         .route("/health", get(|| async { "ok" }))
-        // Order matters: layers applied later are outer. We want
-        // `trace_id_middleware` to run *before* `TraceLayer` so it can
-        // stash the resolved id in request extensions for
-        // `TraceLayer`'s `make_span_with` to read. Tower applies layers
-        // bottom-up: the last `.layer()` in source order becomes the
-        // outermost wrapping, so `from_fn(trace_id_middleware)` below
-        // wraps `TraceLayer` above it, and its pre-handler code runs
-        // first.
+        // `trace_id_middleware` must run before `TraceLayer` opens its span
+        // so the trace id is already in extensions when `make_span_with` reads
+        // it. Tower applies layers bottom-up, so the last `.layer()` call here
+        // is the outermost wrapper and runs first on the way in.
         .layer(
             TraceLayer::new_for_http().make_span_with(|req: &Request| {
-                // Read the trace id our middleware stashed. If it's
-                // missing (shouldn't happen in normal flow), fall back
-                // to the empty string so the span field is still
-                // present in the JSON output — easier to grep for
-                // "missing trace id" than a silently absent key.
+                // Fall back to empty string so the field is always present in
+                // structured logs even if the middleware somehow didn't run.
                 let trace_id = req
                     .extensions()
                     .get::<TraceId>()

@@ -1,29 +1,11 @@
-//! Ambient trace-id context propagated via a tokio task-local.
+//! Ambient trace-id propagated via a tokio task-local.
 //!
-//! The value is read by [`crate::task::scheduler::TaskScheduler::build_pending_task`]
-//! so that any task created inside a `with_trace_id(...)` scope inherits
-//! the trace id of the caller — no plumbing required at every call site.
+//! `TaskScheduler::build_pending_task` reads this so tasks created inside
+//! a `with_trace_id` scope inherit the caller's trace id without any
+//! per-call-site plumbing.
 //!
-//! Typical wiring:
-//!
-//! - **api**: a middleware generates (or extracts from `X-Request-Id` /
-//!   `traceparent`) a trace id per incoming request, records it on the
-//!   current tracing span so it shows up in request logs, and runs the
-//!   downstream handler inside `with_trace_id(Some(id), next).await`.
-//!   Use cases invoked by that handler call into `TaskScheduler`, which
-//!   calls `current_trace_id()` and stamps the id on the new row.
-//!
-//! - **worker**: before the consumer dispatches a task to its handler,
-//!   it wraps the dispatch in `with_trace_id(task.trace_id.clone(), …)`
-//!   so that any *sub-tasks* the handler schedules inherit the same
-//!   trace id as the task that triggered them. The task's own
-//!   `trace_id` field is also recorded on the `task_handler` span so
-//!   handler logs carry it.
-//!
-//! Outside of any scope, `current_trace_id()` returns `None`, and the
-//! scheduler stores `None` — identical to the pre-existing behavior, so
-//! introducing this module is backward-compatible for tests that don't
-//! opt in.
+//! The api layer sets the scope per request; the worker wraps each dispatch
+//! so sub-tasks inherit the same id as the task that triggered them.
 
 use std::future::Future;
 
@@ -31,21 +13,14 @@ tokio::task_local! {
     static TRACE_ID: Option<String>;
 }
 
-/// Return the trace id for the current async task, if a scope set one.
-///
-/// Returns `None` both when there is no active scope and when the
-/// active scope explicitly set `None` — the scheduler treats both the
-/// same way (no trace id on the row), so the distinction doesn't
-/// matter here.
+/// Returns the trace id set by the innermost enclosing `with_trace_id` scope,
+/// or `None` if no scope is active or the scope was set to `None`.
 pub fn current_trace_id() -> Option<String> {
     TRACE_ID.try_with(|id| id.clone()).ok().flatten()
 }
 
-/// Run `f` with `trace_id` set as the ambient trace context. Any code
-/// `.await`ed inside `f` observes `trace_id` via [`current_trace_id`].
-///
-/// The scope ends when `f` resolves; reads after the returned future
-/// completes see whatever (if any) outer scope was active before.
+/// Runs `f` with `trace_id` as the ambient trace context for the duration
+/// of the future. Code inside `f` reads it via [`current_trace_id`].
 pub async fn with_trace_id<F>(trace_id: Option<String>, f: F) -> F::Output
 where
     F: Future,

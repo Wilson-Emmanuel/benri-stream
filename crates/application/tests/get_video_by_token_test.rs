@@ -60,11 +60,7 @@ async fn trailing_slash_in_cdn_is_normalised() {
 
 #[tokio::test]
 async fn returns_stream_url_for_processing_with_share_token() {
-    // Early-publish: once the first variant segment lands the worker
-    // writes the master playlist and sets `share_token`, while the
-    // row is still `Processing`. The viewer should receive a
-    // playable stream URL immediately — not sit on a "processing"
-    // spinner waiting for finalize.
+    // Early-publish: share_token is set while status is still Processing.
     let mut repo = MockVideoRepository::new();
     repo.expect_find_by_share_token()
         .returning(|_| Ok(Some(video(VideoStatus::Processing, "x"))));

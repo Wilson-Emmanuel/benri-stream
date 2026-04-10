@@ -12,8 +12,6 @@ use domain::task::result::{OutcomeKind, TaskResult};
 use domain::task::{Task, TaskId, TaskMetadata, TaskRunOutcome, TaskStatus, TaskUpdate};
 
 /// Execution context passed to handlers alongside their typed metadata.
-/// Fields are part of the handler public API even though no current
-/// handler reads them.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TaskExecutionContext {
@@ -22,11 +20,7 @@ pub struct TaskExecutionContext {
 }
 
 /// Per-type task handler. Receives a fully-typed metadata reference — no
-/// manual JSON extraction. Each handler type binds to exactly one metadata
-/// type via the associated `Metadata` type, so adapter construction does
-/// not require a turbofish.
-///
-/// Register via `HandlerAdapter::wrap` in the dispatch map.
+/// manual JSON extraction.
 #[async_trait]
 pub trait TypedTaskHandler: Send + Sync {
     type Metadata: TaskMetadata + Send + Sync + 'static;
@@ -38,10 +32,8 @@ pub trait TypedTaskHandler: Send + Sync {
     ) -> TaskResult;
 }
 
-/// Type-erased handler held by the dispatch map. Owns the entire
-/// "deserialize → enforce timeout → invoke handler → compute update"
-/// pipeline so the consumer doesn't need access to the typed metadata or
-/// the per-task scheduling config.
+/// Type-erased handler held by the dispatch map. Owns the deserialize →
+/// timeout → invoke → compute_update pipeline.
 #[async_trait]
 pub trait ErasedHandler: Send + Sync {
     async fn invoke(&self, task: &Task) -> TaskRunOutcome;
@@ -57,8 +49,7 @@ impl<H: TypedTaskHandler + 'static> HandlerAdapter<H> {
         Self { inner }
     }
 
-    /// Convenience: wrap a typed handler into a boxed erased trait object
-    /// ready for insertion into the dispatch map.
+    /// Wraps a typed handler into a boxed `ErasedHandler` for the dispatch map.
     pub fn wrap(inner: Arc<H>) -> Arc<dyn ErasedHandler> {
         Arc::new(Self::new(inner))
     }
@@ -70,10 +61,9 @@ impl<H: TypedTaskHandler + 'static> ErasedHandler for HandlerAdapter<H> {
         let metadata: H::Metadata = match serde_json::from_value(task.metadata.clone()) {
             Ok(m) => m,
             Err(e) => {
-                // Bad metadata is a permanent failure — the task cannot
-                // be retried because its payload is unparseable.
-                // `compute_update` is unreachable here (no typed metadata
-                // to pass), so the dead-letter outcome is built by hand.
+                // Unparseable metadata is a permanent failure; build the
+                // dead-letter outcome directly since there's no typed metadata
+                // to pass to compute_update.
                 return dead_letter_outcome(
                     task,
                     format!(
@@ -105,9 +95,6 @@ impl<H: TypedTaskHandler + 'static> ErasedHandler for HandlerAdapter<H> {
             }
         };
 
-        // `compute_update` returns both the DB update and the metric
-        // outcome kind in one match — no parallel can_retry logic to
-        // drift out of sync.
         task.compute_update(&metadata, &result)
     }
 }
@@ -128,7 +115,7 @@ fn dead_letter_outcome(task: &Task, error: String) -> TaskRunOutcome {
     }
 }
 
-/// Dispatches tasks to their handlers by `metadata_type`.
+/// Routes tasks to their registered handler by `metadata_type`.
 #[async_trait]
 pub trait TaskHandlerInvoker: Send + Sync {
     async fn dispatch(&self, task: &Task) -> TaskRunOutcome;

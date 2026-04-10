@@ -28,7 +28,7 @@ async fn publish_then_pop_returns_ids_in_fifo_order() {
     let ids: Vec<TaskId> = (0..3).map(|_| TaskId::new()).collect();
     publisher.publish(&ids).await.unwrap();
 
-    // LPUSH + RPOP → FIFO: first published = first popped.
+    // LPUSH + RPOP = FIFO.
     let mut popped = vec![];
     for _ in 0..3 {
         popped.push(consumer.pop().await.unwrap().unwrap());

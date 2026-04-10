@@ -52,7 +52,6 @@ impl InitiateUploadUseCase {
             created_at: Utc::now(),
         };
 
-        // Single-statement insert — no transaction needed.
         self.video_repo
             .insert(&video)
             .await

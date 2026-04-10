@@ -39,21 +39,19 @@ impl DeleteVideoUseCase {
             return Err(Error::VideoNotFound);
         };
 
-        // 1. Delete the HLS output tree. No-op if prefix is empty
-        //    (e.g. probe-failed videos that never produced segments).
+        // 1. HLS output tree — no-op if prefix is empty (e.g. probe-failed videos).
         self.storage
             .delete_prefix(&video.storage_prefix())
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // 2. Delete the original upload. No-op if the object is already gone
-        //    (e.g. successful processing already deleted it inline).
+        // 2. Original upload — no-op if already deleted by the success path.
         self.storage
             .delete_object(&video.upload_key)
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // 3. Delete the database row — single statement, no transaction needed.
+        // 3. Database row.
         self.video_repo
             .delete(&video.id)
             .await
@@ -70,14 +68,8 @@ pub struct Input {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The video does not exist (likely already deleted). The task handler
-    /// maps this to `TaskResult::Skip` so the task completes cleanly.
     #[error("video not found")]
     VideoNotFound,
-
-    /// Any infrastructure failure (storage, database). The task handler maps
-    /// this to `TaskResult::RetryableFailure` so the task system retries with
-    /// backoff and eventually dead-letters.
     #[error("internal error: {0}")]
     Internal(String),
 }

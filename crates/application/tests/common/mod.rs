@@ -1,22 +1,8 @@
 //! Shared test helpers for application-layer unit tests.
 //!
-//! The main piece here is `FakeTransactionPort` — a hand-rolled
-//! `TransactionPort` impl because `mockall` can't express the
-//! HRTB-laden `TxClosure` signature. It simply runs the provided
-//! closure against a pair of in-memory mock mutation ports
-//! (`MockVideoMutations` and `MockTaskMutations`, both generated
-//! by mockall on the domain side via the `mock` feature).
-//!
-//! Usage pattern:
-//!
-//! ```ignore
-//! let mut videos = MockVideoMutations::new();
-//! let mut tasks = MockTaskMutations::new();
-//! videos.expect_update_status_if().returning(|_, _, _| Ok(true));
-//! tasks.expect_create().returning(|t| Ok(t.clone()));
-//!
-//! let tx = Arc::new(FakeTransactionPort::new(videos, tasks));
-//! ```
+//! [`FakeTransactionPort`] is a hand-rolled `TransactionPort` because
+//! `mockall` cannot express the HRTB-laden `TxClosure` signature. It runs
+//! the closure against in-memory `MockVideoMutations` / `MockTaskMutations`.
 
 use std::sync::Arc;
 

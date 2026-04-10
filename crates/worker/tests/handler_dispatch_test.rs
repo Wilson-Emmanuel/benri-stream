@@ -1,18 +1,8 @@
-//! End-to-end handler dispatch tests.
+//! End-to-end handler dispatch tests: task row → HandlerDispatch → use case
+//! → real DB + real S3 → TaskRunOutcome.
 //!
-//! Verifies the "task row → HandlerDispatch → ErasedHandler → use case →
-//! real DB + real S3 → TaskRunOutcome" chain. We cover two
-//! representative handlers:
-//!
-//! - `DeleteVideoHandler` — mutates storage + DB, must Skip when the
-//!   target is already gone (idempotent), RetryableFailure on infra
-//!   errors.
-//! - `CleanupStaleHandler` — no per-video state, exercises the path
-//!   where the handler schedules *more* tasks via `TaskRepository`.
-//!
-//! The third handler (`ProcessVideoHandler`) is covered by the
-//! application-layer unit tests with `MockTranscoderPort` — running
-//! GStreamer against real video files is out of scope for this suite.
+//! Covers `DeleteVideoHandler` and `CleanupStaleHandler`. `ProcessVideoHandler`
+//! is tested at the application layer with a mock transcoder.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,7 +105,6 @@ async fn delete_video_handler_removes_storage_and_row_and_marks_completed() {
     };
     repo.insert(&video).await.unwrap();
 
-    // Seed the storage surface this video claims to own.
     h.s3.put_object()
         .bucket(&h.upload_bucket)
         .key(&upload_key)
@@ -178,7 +167,6 @@ async fn cleanup_stale_handler_schedules_delete_tasks_for_stale_videos() {
     let video_repo = PostgresVideoRepository::new(h.pool.clone());
     let task_repo = PostgresTaskRepository::new(h.pool.clone());
 
-    // Seed a stale Uploaded video so the sweep has something to do.
     let mut stale = Video {
         id: VideoId::new(),
         share_token: None,
@@ -189,7 +177,6 @@ async fn cleanup_stale_handler_schedules_delete_tasks_for_stale_videos() {
         created_at: Utc::now() - ChronoDuration::hours(48),
     };
     stale.status = VideoStatus::Uploaded;
-    // Direct insert so we can set created_at in the past.
     sqlx::query(
         "INSERT INTO videos (id, share_token, title, format, status, upload_key, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -222,11 +209,9 @@ async fn cleanup_stale_handler_schedules_delete_tasks_for_stale_videos() {
     assert_eq!(outcome.update.status, TaskStatus::Pending);
     assert!(outcome.update.next_run_at.is_some());
 
-    // Stale video was bulk-marked Failed by the sweep.
     let after = video_repo.find_by_id(&stale.id).await.unwrap().unwrap();
     assert_eq!(after.status, VideoStatus::Failed);
 
-    // At least one new DeleteVideo task exists.
     let after_count = task_repo
         .count_active_by_type(
             DeleteVideoTaskMetadata {
@@ -243,7 +228,6 @@ async fn cleanup_stale_handler_schedules_delete_tasks_for_stale_videos() {
 async fn dispatch_unknown_metadata_type_returns_dead_letter() {
     let h = harness().await;
 
-    // Build a bare task row with a metadata type that's not registered.
     let task = domain::task::Task {
         id: domain::task::TaskId::new(),
         metadata_type: "NoSuchType".into(),
@@ -270,7 +254,6 @@ async fn dispatch_unknown_metadata_type_returns_dead_letter() {
 async fn dispatch_bad_metadata_json_dead_letters() {
     let h = harness().await;
 
-    // Use a registered type but put nonsense in the metadata field.
     let task = domain::task::Task {
         id: domain::task::TaskId::new(),
         metadata_type: DeleteVideoTaskMetadata {

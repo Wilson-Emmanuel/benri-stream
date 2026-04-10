@@ -6,24 +6,19 @@ use domain::ports::error::RepositoryError;
 use domain::ports::task::TaskRepository;
 use domain::task::{Task, TaskId, TaskStatus, TaskUpdate};
 
-/// Selected columns for `tasks`. Listed once so the SELECTs and the row
-/// mapper can't drift.
+/// Selected columns for `tasks`, shared between SELECT queries and the row mapper.
 const TASK_COLUMNS: &str = "id, metadata_type, metadata, status, ordering_key, trace_id, \
                             attempt_count, next_run_at, error, started_at, completed_at, \
                             created_at, updated_at";
 
-/// Same as `TASK_COLUMNS` but every column prefixed with `t.` for use
-/// inside JOIN queries that alias the tasks table as `t`.
+/// `TASK_COLUMNS` with each column prefixed with `t.` for JOIN queries.
 const TASK_COLUMNS_T: &str = "t.id, t.metadata_type, t.metadata, t.status, t.ordering_key, \
                               t.trace_id, t.attempt_count, t.next_run_at, t.error, \
                               t.started_at, t.completed_at, t.created_at, t.updated_at";
 
-/// Stale-recovery threshold. Must match `STALE_RECOVERY_THRESHOLD` in
-/// `architecture/backend/task-system.md`. Tasks stuck IN_PROGRESS for
-/// longer than this are reset to PENDING by `reset_stale`.
-///
-/// Single source of truth here so changing the threshold doesn't require
-/// hunting through SQL strings.
+/// Stale-recovery threshold. Tasks stuck IN_PROGRESS longer than this are
+/// reset to PENDING by `reset_stale`. Must match the value documented in
+/// `architecture/backend/task-system.md`.
 const STALE_RECOVERY_INTERVAL: &str = "1 hour";
 
 pub struct PostgresTaskRepository {
@@ -36,10 +31,10 @@ impl PostgresTaskRepository {
     }
 }
 
-/// Map a `tasks` row into the domain entity. Panics on unknown
-/// `TaskStatus` values (corrupt DB / missing migration). Logs and
-/// substitutes `Value::Null` for unparseable JSON metadata so the handler
-/// can mark the task `PermanentFailure` instead of crashing the worker.
+/// Map a `tasks` row into the domain entity. Panics on unknown `TaskStatus`
+/// values (corrupt DB or missing migration). Substitutes `Value::Null` for
+/// unparseable JSON so the handler can mark the task failed rather than
+/// crashing the worker.
 fn row_to_task(row: sqlx::postgres::PgRow) -> Task {
     let metadata_str: String = row.get("metadata");
     let metadata = match serde_json::from_str(&metadata_str) {
@@ -98,32 +93,22 @@ impl TaskRepository for PostgresTaskRepository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Returns the next batch of PENDING tasks eligible to run.
-    ///
-    /// Respects ordering keys in SQL:
-    /// 1. Tasks without an ordering key are always eligible.
-    /// 2. Tasks with an ordering key whose sibling is IN_PROGRESS are skipped.
-    /// 3. For tasks with an ordering key, only the oldest per key is returned.
-    ///
-    /// Ordered by `next_run_at ASC, id ASC`, capped at `limit`. Single
-    /// query: a CTE selects eligible IDs and the outer SELECT joins to
-    /// fetch full rows in one round trip.
+    /// Returns the next batch of PENDING tasks eligible to run. Ordering key
+    /// rules are enforced in SQL: tasks blocked by an IN_PROGRESS sibling are
+    /// excluded, and for keyed tasks only the oldest per key is returned.
+    /// Results are ordered by `next_run_at ASC, id ASC` and capped at `limit`.
     async fn find_pending(
         &self,
         limit: i32,
         before: DateTime<Utc>,
     ) -> Result<Vec<Task>, RepositoryError> {
         tracing::debug!(limit, "db: find pending tasks");
-        // SQL structure:
-        //   blocked_keys → ordering keys with an IN_PROGRESS task (cannot start another)
-        //   eligible     → PENDING tasks not blocked by an in-progress sibling
-        //   keyed_dedup  → for keyed eligible tasks, pick the oldest per ordering_key.
-        //                  DISTINCT ON requires its own ORDER BY, so it lives in its
-        //                  own CTE — Postgres rejects ORDER BY directly before UNION
-        //                  without parenthesizing each branch, and a separate CTE
-        //                  is cleaner than nested parens.
-        //   selected     → keyed_dedup ∪ unkeyed eligible
-        //   final SELECT → join back to tasks for the full row, order, and limit
+        // blocked_keys → ordering keys with an IN_PROGRESS task
+        // eligible     → PENDING tasks not blocked by an in-progress sibling
+        // keyed_dedup  → oldest PENDING task per ordering_key (DISTINCT ON
+        //                requires its own ORDER BY, hence a separate CTE)
+        // selected     → keyed_dedup ∪ unkeyed eligible
+        // final SELECT → join for full row, ordered and limited
         sqlx::query(&format!(
             r#"
             WITH blocked_keys AS (
@@ -188,17 +173,12 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
-    /// Apply N updates as a single atomic SQL statement.
+    /// Apply updates in a single `UPDATE ... FROM UNNEST(...)` statement.
     ///
-    /// Uses `UPDATE ... FROM UNNEST(...)` so the whole batch is one trip
-    /// to Postgres. Because it's a single statement, Postgres autocommits
-    /// it atomically — no enclosing transaction needed.
-    ///
-    /// `next_run_at` is COALESCEd against the existing row value: a `None`
-    /// in `TaskUpdate.next_run_at` means "leave the column alone" rather
-    /// than "set it to NULL" (the column is `NOT NULL`). This matters for
-    /// terminal outcomes (`Completed`, `DeadLetter`) where `compute_update`
-    /// returns `next_run_at: None` because no future run is expected.
+    /// `next_run_at` is COALESCEd against the existing row value: `None`
+    /// means "leave unchanged" rather than "set NULL" (the column is NOT NULL).
+    /// Terminal outcomes (`Completed`, `DeadLetter`) pass `None` here because
+    /// no future run is scheduled.
     async fn batch_update(&self, updates: &[TaskUpdate]) -> Result<(), RepositoryError> {
         if updates.is_empty() {
             return Ok(());
@@ -250,11 +230,9 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
-    /// Reset tasks stuck IN_PROGRESS for longer than the global stale
-    /// threshold. This is a fixed value, not per-task: every task type's
-    /// `processing_timeout` MUST be less than this threshold so a running
-    /// handler is never reset by stale recovery. Today the per-task limit
-    /// is 30 minutes — see `TaskMetadata` docstring.
+    /// Reset tasks stuck IN_PROGRESS longer than `STALE_RECOVERY_INTERVAL`.
+    /// Every task type's `processing_timeout` must be shorter than this
+    /// threshold so a healthy handler is never interrupted by stale recovery.
     async fn reset_stale(&self) -> Result<i32, RepositoryError> {
         let result = sqlx::query(&format!(
             "UPDATE tasks SET status = 'PENDING', started_at = NULL, updated_at = NOW()
@@ -326,8 +304,7 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(task.clone())
     }
 
-    /// Bulk-insert N tasks in a single statement using `INSERT ... SELECT
-    /// FROM UNNEST(...)`. One round trip, atomic at the statement level.
+    /// Bulk-insert tasks in a single `INSERT ... SELECT FROM UNNEST(...)` statement.
     async fn bulk_create(&self, tasks: &[Task]) -> Result<(), RepositoryError> {
         if tasks.is_empty() {
             return Ok(());

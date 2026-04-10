@@ -8,11 +8,8 @@ use domain::ports::transaction::{
 use domain::task::Task;
 use domain::video::{VideoId, VideoStatus};
 
-/// Postgres-backed implementation of [`TransactionPort`].
-///
-/// Opens a sqlx transaction on each `run` call, wraps it in a
-/// [`PgTxScope`], runs the caller's closure, and commits or rolls back
-/// based on the closure's result.
+/// Postgres-backed [`TransactionPort`]. Opens a sqlx transaction per `run`
+/// call, commits on success, rolls back on error.
 pub struct PgTransactionPort {
     pool: PgPool,
 }
@@ -41,9 +38,8 @@ impl TransactionPort for PgTransactionPort {
                 .await
                 .map_err(|e| RepositoryError::Database(e.to_string())),
             Err(e) => {
-                // Explicit rollback for clarity. On drop sqlx also rolls
-                // back, but explicit is nicer when reasoning about the
-                // control flow.
+                // Explicit rollback; sqlx also rolls back on drop, but
+                // being explicit makes the control flow easier to follow.
                 let _ = scope.tx.rollback().await;
                 Err(e)
             }
@@ -51,10 +47,8 @@ impl TransactionPort for PgTransactionPort {
     }
 }
 
-/// A concrete `TxScope` backed by a sqlx transaction. Dereferences to the
-/// mutation trait impls below — `videos()` and `tasks()` both return
-/// `&mut self` typed at the trait, because this same struct implements
-/// both `VideoMutations` and `TaskMutations`.
+/// A `TxScope` backed by a live sqlx transaction. Implements both
+/// `VideoMutations` and `TaskMutations`, so both accessors return `&mut self`.
 pub struct PgTxScope {
     tx: Transaction<'static, Postgres>,
 }

@@ -237,7 +237,6 @@ async fn invalid_signature_schedules_delete_and_returns_error() {
 
 #[tokio::test]
 async fn lost_claim_race_returns_already_completed() {
-    // update_status_if returns false → another worker already claimed it.
     let id = VideoId::new();
     let id_c = id.clone();
 
@@ -262,7 +261,6 @@ async fn lost_claim_race_returns_already_completed() {
         .expect_update_status_if()
         .returning(|_, _, _| Ok(false));
     let mut task_muts = MockTaskMutations::new();
-    // Must not be called when claim fails.
     task_muts.expect_create().never();
 
     let tx = Arc::new(FakeTransactionPort::new(video_muts, task_muts));

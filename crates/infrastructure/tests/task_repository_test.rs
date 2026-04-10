@@ -73,7 +73,7 @@ async fn find_pending_returns_due_tasks_in_order() {
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool);
 
-    // Use a fresh ordering-key family so this test only sees its own rows.
+    // Fresh ordering-key family so this test only sees its own rows.
     let family = format!("fp:{}", TaskId::new());
     let mut earlier = build(Some(&family));
     let mut later = build(Some(&format!("{family}:b")));
@@ -93,7 +93,7 @@ async fn find_pending_returns_due_tasks_in_order() {
         })
         .collect();
     assert_eq!(ours.len(), 2);
-    // Earlier one comes first (older next_run_at).
+    // Older next_run_at comes first.
     assert_eq!(ours[0].id, earlier.id);
     assert_eq!(ours[1].id, later.id);
 }
@@ -109,12 +109,12 @@ async fn find_pending_blocks_on_in_progress_sibling() {
     repo.create(&first).await.unwrap();
     repo.create(&second).await.unwrap();
 
-    // Claim the first.
+    // Mark first in-progress.
     repo.mark_in_progress(std::slice::from_ref(&first.id), Utc::now())
         .await
         .unwrap();
 
-    // `second` must not be returned — its sibling is in progress.
+    // second must be excluded — its sibling is in progress.
     let pending = repo.find_pending(100, Utc::now()).await.unwrap();
     assert!(!pending.iter().any(|t| t.id == second.id));
     assert!(!pending.iter().any(|t| t.id == first.id));
@@ -170,7 +170,7 @@ async fn reset_stale_revives_stuck_in_progress_tasks() {
     let task = build(None);
     repo.create(&task).await.unwrap();
 
-    // Put it IN_PROGRESS with started_at older than the 1h threshold.
+    // Set IN_PROGRESS with started_at older than the 1h threshold.
     sqlx::query(
         "UPDATE tasks SET status = 'IN_PROGRESS', started_at = $2 WHERE id = $1",
     )
@@ -193,7 +193,7 @@ async fn count_active_by_type_counts_pending_and_in_progress() {
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool);
 
-    // Fresh type name so this test doesn't collide with others.
+    // Unique type name to avoid collisions with other tests.
     #[derive(Debug, Serialize, Deserialize)]
     struct UniqMeta;
     impl TaskMetadata for UniqMeta {
@@ -216,7 +216,7 @@ async fn count_active_by_type_counts_pending_and_in_progress() {
         .unwrap();
     assert_eq!(n, 2);
 
-    // Complete one; count drops.
+    // Complete one; active count drops.
     let now = Utc::now();
     repo.batch_update(&[TaskUpdate {
         task_id: a.id.clone(),
@@ -237,13 +237,10 @@ async fn count_active_by_type_counts_pending_and_in_progress() {
     assert_eq!(n, 1);
 }
 
-// ---- find_pending: keyed-dedup branch ----
-
 #[tokio::test]
 async fn find_pending_dedups_by_ordering_key_returning_oldest() {
-    // Two PENDING tasks with the same ordering key — the CTE's
-    // `DISTINCT ON (ordering_key) ... ORDER BY ordering_key,
-    // next_run_at ASC` should return only the older one.
+    // Two PENDING tasks with the same ordering key — only the older
+    // next_run_at should be returned.
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool);
     let key = format!("dedup:{}", TaskId::new());
@@ -260,11 +257,9 @@ async fn find_pending_dedups_by_ordering_key_returning_oldest() {
         .iter()
         .filter(|t| t.ordering_key.as_deref() == Some(key.as_str()))
         .collect();
-    assert_eq!(ours.len(), 1, "keyed dedup must collapse siblings");
-    assert_eq!(ours[0].id, older.id, "older next_run_at wins");
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].id, older.id);
 }
-
-// ---- find_pending: unkeyed eligible path ----
 
 #[tokio::test]
 async fn find_pending_returns_unkeyed_tasks() {
@@ -282,8 +277,6 @@ async fn find_pending_returns_unkeyed_tasks() {
     assert!(ids.contains(&b.id));
 }
 
-// ---- find_pending: next_run_at cutoff ----
-
 #[tokio::test]
 async fn find_pending_excludes_tasks_scheduled_in_the_future() {
     let pool = pg_pool().await;
@@ -295,22 +288,16 @@ async fn find_pending_excludes_tasks_scheduled_in_the_future() {
     repo.create(&future).await.unwrap();
 
     let pending = repo.find_pending(1000, Utc::now()).await.unwrap();
-    assert!(
-        !pending.iter().any(|t| t.id == future.id),
-        "task with next_run_at in the future must be excluded by cutoff",
-    );
+    assert!(!pending.iter().any(|t| t.id == future.id));
 }
-
-// ---- find_pending: limit ----
 
 #[tokio::test]
 async fn find_pending_respects_limit() {
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool);
 
-    // Seed 5 unkeyed tasks, ask for 2, assert at most 2 come back.
-    // Other tests in the same binary may leave rows behind, so we
-    // assert `<= 2` — that alone proves the LIMIT clause is active.
+    // Seed 5 tasks, ask for 2. Other tests may leave rows behind, so
+    // assert <= 2 rather than == 2 — that still proves LIMIT is active.
     for _ in 0..5 {
         let t = build(None);
         repo.create(&t).await.unwrap();
@@ -324,15 +311,10 @@ async fn find_pending_respects_limit() {
     );
 }
 
-// ---- batch_update: COALESCE next_run_at ----
-
 #[tokio::test]
 async fn batch_update_with_none_next_run_at_preserves_existing_value() {
-    // The production SQL uses `COALESCE(v.next_run_at, t.next_run_at)`
-    // precisely so terminal outcomes (Completed, DeadLetter) that set
-    // `next_run_at: None` in the update don't clobber the existing
-    // column value with NULL — the column is NOT NULL. This pins that
-    // behavior.
+    // COALESCE(v.next_run_at, t.next_run_at) means None = "leave unchanged",
+    // not "set NULL". Terminal outcomes (Completed, DeadLetter) pass None.
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool.clone());
 
@@ -382,8 +364,6 @@ async fn batch_update_empty_slice_is_ok() {
     repo.batch_update(&[]).await.unwrap();
 }
 
-// ---- bulk_create: ordering_key column path ----
-
 #[tokio::test]
 async fn bulk_create_populates_ordering_key_and_metadata_type() {
     let pool = pg_pool().await;
@@ -406,13 +386,9 @@ async fn bulk_create_populates_ordering_key_and_metadata_type() {
     }
 }
 
-// ---- TaskStatus column round-trip ----
-
 #[tokio::test]
 async fn all_task_statuses_round_trip_through_the_database() {
-    // The row mapper calls `TaskStatus::from_str` on whatever the DB
-    // returns; a drift between `as_str()` and `from_str()` would
-    // panic here. Covers all four variants in one go.
+    // Drift between as_str() and from_str() would panic in the row mapper.
     let pool = pg_pool().await;
     let repo = PostgresTaskRepository::new(pool);
 

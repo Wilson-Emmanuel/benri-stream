@@ -84,17 +84,14 @@ impl CompleteUploadUseCase {
             return Err(Error::InvalidFileSignature);
         }
 
-        // Success path: atomic status update + ProcessVideo scheduling in
-        // one tx. The task must be scheduled in the same transaction as
-        // the triggering business mutation — if the status update races
-        // another worker (status no longer PENDING_UPLOAD), the whole tx
-        // rolls back and no stale task is left behind.
+        // Atomic status update + ProcessVideo scheduling in one tx.
+        // If the status update races another worker the whole tx rolls back,
+        // leaving no stale task behind.
         //
-        // `claimed` is an owned `Arc<AtomicBool>` so the closure can be
-        // `'static` while still allowing the result to be read after the
-        // tx commits.
-        let claimed = Arc::new(AtomicBool::new(false));
-        let claimed_w = claimed.clone();
+        // `transitioned` is Arc<AtomicBool> so the closure is `'static`
+        // while the result is readable after the tx commits.
+        let transitioned = Arc::new(AtomicBool::new(false));
+        let transitioned_w = transitioned.clone();
         let id_for_tx = video.id.clone();
 
         self.tx
@@ -104,11 +101,9 @@ impl CompleteUploadUseCase {
                         .videos()
                         .update_status_if(&id_for_tx, VideoStatus::PendingUpload, VideoStatus::Uploaded)
                         .await?;
-                    claimed_w.store(ok, Ordering::Relaxed);
+                    transitioned_w.store(ok, Ordering::Relaxed);
                     if !ok {
-                        // Return Ok — the tx commits with no changes.
-                        // The caller sees `claimed == false` and returns
-                        // AlreadyCompleted without scheduling the task.
+                        // Tx commits with no changes; caller sees transitioned==false.
                         return Ok(());
                     }
                     TaskScheduler::schedule_in_tx(
@@ -123,7 +118,7 @@ impl CompleteUploadUseCase {
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        if !claimed.load(Ordering::Relaxed) {
+        if !transitioned.load(Ordering::Relaxed) {
             return Err(Error::AlreadyCompleted);
         }
 
@@ -134,10 +129,8 @@ impl CompleteUploadUseCase {
     }
 }
 
-/// Schedule a `DeleteVideo` task standalone (no transaction, no business
-/// mutation to bundle with — the rejected video stays in `PENDING_UPLOAD`
-/// and the task cleans it up). If the schedule itself fails, log it and
-/// let the safety-net sweep (UC-VID-006) collect the orphaned video later.
+/// Schedules a standalone `DeleteVideo` task for a rejected video.
+/// If scheduling fails, the safety-net sweep (UC-VID-006) will collect it.
 async fn schedule_delete_after_rejection(
     task_repo: &dyn TaskRepository,
     video_id: &VideoId,

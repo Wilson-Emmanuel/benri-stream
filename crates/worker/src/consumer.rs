@@ -19,10 +19,8 @@ pub struct TaskConsumerLoop {
     consumer: Arc<dyn TaskConsumer>,
     task_repo: Arc<dyn TaskRepository>,
     handler: Arc<dyn TaskHandlerInvoker>,
-    /// Limits how many tasks this worker can be running at once. The
-    /// consumer acquires a permit before popping the next task and
-    /// releases it when the task finishes, so the pop loop naturally
-    /// backpressures against the concurrency cap.
+    /// Bounds in-flight tasks. A permit is acquired before each pop and held
+    /// for the task's lifetime, so the loop backpressures naturally.
     concurrency: Arc<Semaphore>,
 }
 
@@ -41,18 +39,9 @@ impl TaskConsumerLoop {
         }
     }
 
-    /// Consume tasks until `shutdown` is set to `true`. On shutdown, any
-    /// in-flight tasks are allowed to finish (bounded by their
-    /// processing timeouts). No new tasks are popped.
-    ///
-    /// Concurrency shape: the loop holds up to `max_concurrent_tasks`
-    /// in-flight handler runs via a `Semaphore`, acquiring a permit
-    /// *before* popping from the queue so we never take a task off
-    /// Redis we don't have capacity to run. Each permit is held for
-    /// the lifetime of the spawned per-task future — the semaphore's
-    /// internal counter backpressures the pop loop automatically.
+    /// Consumes tasks until `shutdown` is set to `true`, then drains
+    /// in-flight handlers before returning.
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
-        // Track in-flight per-task futures so shutdown can drain them.
         let mut in_flight: JoinSet<()> = JoinSet::new();
 
         loop {
@@ -65,18 +54,16 @@ impl TaskConsumerLoop {
                 return;
             }
 
-            // Block the pop loop until we have capacity to actually
-            // run whatever we pop. Attaching the permit to the spawned
-            // task's lifetime (via `OwnedSemaphorePermit`) keeps the
-            // accounting automatic — when the task future finishes, the
-            // permit drops and a new slot opens up.
+            // Acquire a permit before popping so we never dequeue a task we
+            // can't immediately run. The permit is moved into the spawned future
+            // and dropped when it completes.
             let permit = tokio::select! {
                 _ = shutdown.changed() => continue,
                 res = self.concurrency.clone().acquire_owned() => {
                     match res {
                         Ok(p) => p,
                         Err(_) => {
-                            // Semaphore closed — shouldn't happen.
+                            // Semaphore closed — unreachable in normal operation.
                             return;
                         }
                     }
@@ -108,16 +95,13 @@ impl TaskConsumerLoop {
                 }
             }
 
-            // Reap any finished in-flight tasks opportunistically so
-            // the JoinSet doesn't grow unbounded. `try_join_next` is
-            // non-blocking and just drains whatever is already done.
+            // Drain completed futures so the JoinSet doesn't grow unbounded.
             while in_flight.try_join_next().is_some() {}
         }
     }
 
-    /// Run a single task through the handler dispatcher and persist
-    /// the outcome. No `&self` so it can be called from a detached
-    /// tokio task without a 'static bound on `Self`.
+    /// Runs a single task through the handler dispatcher and persists the
+    /// outcome. Takes no `&self` so it can be called from a detached future.
     async fn process_one(
         task_repo: &Arc<dyn TaskRepository>,
         handler: &Arc<dyn TaskHandlerInvoker>,
@@ -144,9 +128,6 @@ impl TaskConsumerLoop {
             return;
         }
 
-        // Open a span for the handler invocation. Include the trace_id so
-        // logs emitted by the handler are grep-able back to the original
-        // request that scheduled this task.
         let span = tracing::info_span!(
             "task_handler",
             task_id = %task.id,
@@ -158,15 +139,8 @@ impl TaskConsumerLoop {
             span.record("trace_id", tracing::field::display(tid));
         }
 
-        // Dispatcher owns timeout enforcement and compute_update — the
-        // consumer just hands it the task and writes the resulting update.
-        //
-        // Wrap the dispatch in a `with_trace_id` scope so any sub-tasks
-        // the handler schedules (e.g. a follow-up job from
-        // `process_video`) inherit this task's trace_id via the
-        // scheduler's ambient read. Without this, only the top-level
-        // request's tasks would carry the id and the chain would break
-        // at every task boundary.
+        // Wrap dispatch in a `with_trace_id` scope so any tasks the handler
+        // schedules inherit this task's trace_id.
         let handler = handler.clone();
         let task_for_dispatch = task.clone();
         let trace_id = task.trace_id.clone();
@@ -187,11 +161,9 @@ impl TaskConsumerLoop {
             );
         }
 
-        // Metric labeling derives from the typed outcome kind, NOT from
-        // update.status. update.status is ambiguous (`Pending` could be
-        // either a successful recurring reschedule OR a retry from
-        // failure). The dispatcher knows the original TaskResult variant
-        // and produces the correct OutcomeKind in one place.
+        // OutcomeKind is unambiguous for metrics: TaskStatus::Pending covers
+        // both retries and successful recurring reschedules, but OutcomeKind
+        // distinguishes them.
         match outcome_kind {
             OutcomeKind::Success => {
                 metrics::counter!("task.succeeded", "metadata_type" => metadata_type)

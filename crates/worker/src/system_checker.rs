@@ -12,14 +12,10 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 const LOCK_KEY: &str = "benri:task:system_checker:lock";
 const LOCK_TTL_SECS: u64 = 60;
 
-/// Ensures recurring system tasks always exist. For each registered system
-/// task type: if no active (`PENDING` or `IN_PROGRESS`) instance exists,
-/// schedules a new one.
-///
-/// The recurring-task machinery in `Task::compute_update` reschedules a
-/// completed system task for its next interval, so this checker's main
-/// job is bootstrapping missing tasks after a cold start or after a
-/// dead-lettered instance.
+/// Bootstraps recurring system tasks. For each registered type, schedules a
+/// new instance if no active (`PENDING` or `IN_PROGRESS`) row exists.
+/// `Task::compute_update` handles rescheduling after successful completion, so
+/// this checker mainly covers cold starts and dead-lettered instances.
 pub struct SystemTaskChecker {
     task_repo: Arc<dyn TaskRepository>,
     lock: Arc<dyn DistributedLockPort>,
@@ -64,17 +60,14 @@ impl SystemTaskChecker {
             None => return Ok(()),
         };
 
-        // A panic inside `do_check` skips the release and waits out the
-        // lock TTL (LOCK_TTL_SECS). Acceptable: the system task checker
-        // runs every CHECK_INTERVAL and another instance picks up on
-        // the next cycle.
+        // On panic the lock expires via its TTL; another instance picks up
+        // on the next cycle.
         let result = self.do_check().await;
         let _ = self.lock.release(LOCK_KEY, &token).await;
         result
     }
 
     async fn do_check(&self) -> Result<(), String> {
-        // Add each new system task type here.
         self.ensure_active(CleanupStaleVideosTaskMetadata::METADATA_TYPE, || {
             CleanupStaleVideosTaskMetadata
         })
@@ -100,8 +93,6 @@ impl SystemTaskChecker {
 
         tracing::info!(metadata_type, "creating missing system task");
         let metadata = make_metadata();
-        // Single-statement insert — no business mutation to bundle with,
-        // so no transaction is needed.
         TaskScheduler::schedule_standalone(self.task_repo.as_ref(), &metadata, None)
             .await
             .map_err(|e| e.to_string())?;

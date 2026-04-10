@@ -8,29 +8,18 @@ use super::{Task, TaskId, TaskMetadata, TaskStatus};
 
 /// Stateless entry point for creating tasks.
 ///
-/// **No deduplication.** Multiple `schedule*` calls for the same logical
-/// task may create multiple rows. Handlers MUST be idempotent (see
-/// `task-system.md` "Handler Idempotency"). For resource serialization
-/// (preventing two handlers from running concurrently on the same
-/// resource), use `TaskMetadata::ordering_key`.
+/// No deduplication — multiple calls for the same logical task create multiple
+/// rows. Handlers must be idempotent. For resource serialization (preventing
+/// concurrent runs on the same resource), use `TaskMetadata::ordering_key`.
 pub struct TaskScheduler;
 
 impl TaskScheduler {
-    /// Construct a Task row in the PENDING state without inserting it.
-    /// This is the **single source of truth** for how a TaskMetadata
-    /// becomes a Task row. Both `schedule_in_tx` / `schedule_standalone`
-    /// and bulk callers (like the cleanup sweep that uses
-    /// `TaskRepository::bulk_create`) go through this helper so they
-    /// can never drift.
+    /// Builds a `Task` row in `Pending` state without inserting it.
     ///
-    /// `run_at` defaults to `now` when `None`.
-    ///
-    /// **trace_id** is picked up from the ambient
-    /// [`trace_context::current_trace_id`] so any task created inside
-    /// a `with_trace_id` scope inherits the caller's trace id. Outside
-    /// of a scope the value is `None` — identical to the pre-existing
-    /// behavior, which is why tests that don't opt in continue to work
-    /// unchanged.
+    /// All scheduling paths go through here so the shape of a new row
+    /// is defined in one place. `run_at` defaults to `now` when `None`.
+    /// The trace id is read from the ambient [`trace_context::current_trace_id`]
+    /// so tasks created inside a `with_trace_id` scope inherit the caller's id.
     pub fn build_pending_task<M: TaskMetadata>(
         metadata: &M,
         run_at: Option<DateTime<Utc>>,
@@ -56,10 +45,8 @@ impl TaskScheduler {
         })
     }
 
-    /// Schedule a task inside an open transaction. Use when the schedule
-    /// must be atomic with a business mutation — e.g. the use case updates
-    /// a row and wants the task to exist if and only if the row update
-    /// commits.
+    /// Inserts a task inside an open transaction, atomic with any other
+    /// writes in that transaction.
     pub async fn schedule_in_tx<M: TaskMetadata>(
         tasks: &mut dyn TaskMutations,
         metadata: &M,
@@ -69,9 +56,7 @@ impl TaskScheduler {
         tasks.create(&task).await
     }
 
-    /// Schedule a task standalone, without a transaction. Use when there
-    /// is no business mutation to bundle with — system tasks, recurring
-    /// schedules, fire-and-forget retries.
+    /// Inserts a task directly against the pool, without an enclosing transaction.
     pub async fn schedule_standalone<M: TaskMetadata>(
         repo: &dyn TaskRepository,
         metadata: &M,

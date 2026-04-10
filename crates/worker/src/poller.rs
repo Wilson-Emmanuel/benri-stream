@@ -58,12 +58,9 @@ impl OutboxPoller {
             None => return Ok(()),
         };
 
-        // The release runs on the normal Ok/Err path. If `do_poll` panics
-        // the release is skipped and the lock waits out the TTL — short
-        // enough (LOCK_TTL_SECS) that another instance picks up on the
-        // next interval. A drop-guard would be tidier but mixing async
-        // release with sync `Drop` is awkward; the TTL fallback is the
-        // standard pattern for Redis locks of this style.
+        // If `do_poll` panics, the release is skipped and the lock expires via
+        // its TTL. A drop-guard is impractical with async release, so TTL
+        // expiry is the intended fallback.
         let result = self.do_poll().await;
         let _ = self.lock.release(LOCK_KEY, &token).await;
         result
@@ -83,8 +80,8 @@ impl OutboxPoller {
 
         let ids: Vec<_> = pending.iter().map(|t| t.id.clone()).collect();
 
-        // Update-first: mark IN_PROGRESS before publishing. If publish
-        // fails, stale recovery will reset them to PENDING.
+        // Mark IN_PROGRESS before publishing; stale recovery resets any that
+        // never reach the queue.
         self.task_repo
             .mark_in_progress(&ids, now)
             .await

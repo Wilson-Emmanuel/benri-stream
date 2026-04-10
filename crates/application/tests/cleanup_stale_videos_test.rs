@@ -40,9 +40,8 @@ async fn empty_state_does_not_touch_task_repo() {
 
 #[tokio::test]
 async fn stuck_videos_are_marked_failed_and_scheduled() {
-    // 1 PendingUpload + 1 Uploaded + 1 Processing stale, 2 old Failed.
-    // Stuck count = 2 (Uploaded, Processing).
-    // Total DeleteVideo tasks scheduled = 3 stale + 2 failed = 5.
+    // 3 stale (1 PendingUpload, 1 Uploaded, 1 Processing) + 2 old Failed.
+    // Stuck count = 2; total DeleteVideo tasks = 5.
     let mut video_repo = MockVideoRepository::new();
     let mut task_repo = MockTaskRepository::new();
 
@@ -101,7 +100,6 @@ async fn stuck_videos_are_marked_failed_and_scheduled() {
     assert!(statuses.contains(&VideoStatus::Processing));
 
     assert_eq!(*captured_tasks.lock().unwrap(), 5);
-    // Task metadata_type must match the DeleteVideo meta.
     let expected = DeleteVideoTaskMetadata {
         video_id: VideoId::new(),
     };

@@ -1,25 +1,16 @@
 use std::time::Duration;
 
-/// What `Task::compute_update` decided about a task run, summarized for
-/// metric labeling. Derived directly from the original `TaskResult`
-/// variant plus retry state — **not** from `TaskUpdate.status`, which
-/// is ambiguous (`Pending` can mean either a successful recurring
-/// reschedule OR a retry-after-failure).
-///
-/// Lives next to `TaskResult` because the two are computed together
-/// in one place (`compute_update`) and the `OutcomeKind` is the
-/// caller-facing summary of which variant was hit.
+/// Outcome classification for metric labeling, derived from the `TaskResult`
+/// variant plus retry state. Distinct from `TaskUpdate.status` because
+/// `Pending` is ambiguous there — it covers both a successful recurring
+/// reschedule and a retry-after-failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeKind {
-    /// Handler completed successfully (one-shot or recurring), or chose
-    /// to skip on this run, or terminated a recurring task. None of
-    /// these are failures.
+    /// Handler succeeded, skipped, or terminated a recurring task.
     Success,
-    /// Handler returned `RetryableFailure` and retries remain — the
-    /// task will be re-attempted.
+    /// Handler returned `RetryableFailure` and retries remain.
     Retried,
-    /// Permanent failure: `PermanentFailure`, retries exhausted, bad
-    /// metadata, or no handler registered.
+    /// `PermanentFailure`, retries exhausted, bad metadata, or no handler registered.
     Failed,
 }
 
@@ -58,10 +49,7 @@ pub enum TaskResult {
     /// reschedules without counting as a failure.
     Skip { reason: String },
 
-    /// Terminate a recurring task.
-    ///
-    /// Marks the task `COMPLETED` and prevents future executions. Use this
-    /// when a recurring task's work is done and should not run again until
-    /// the system task checker recreates it (if applicable).
+    /// Marks a recurring task `COMPLETED` and stops future executions.
+    /// The system-task checker will recreate it if applicable.
     Terminate { reason: String },
 }
